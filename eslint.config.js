@@ -2,6 +2,7 @@ import globals from "globals";
 import pluginJs from "@eslint/js";
 import tseslint from "typescript-eslint";
 import pluginReact from "eslint-plugin-react";
+import pluginReactHooks from "eslint-plugin-react-hooks";
 import jsxA11y from "eslint-plugin-jsx-a11y";
 
 /** @type {import('eslint').Linter.Config[]} */
@@ -20,6 +21,7 @@ export default [
   {
     plugins: {
       'jsx-a11y': jsxA11y,
+      'react-hooks': pluginReactHooks,
     },
     rules: {
       "@typescript-eslint/ban-ts-comment": "off",
@@ -33,7 +35,21 @@ export default [
       "no-unsafe-optional-chaining": "off",
       "no-useless-escape": "off",
       "prefer-const": "off",
+      "react/display-name": "off",
       "react/no-unescaped-entities": "off",
+      "react/prop-types": "off",
+      "react/react-in-jsx-scope": "off",
+      "no-restricted-syntax": [
+        "error",
+        {
+          selector: "CallExpression[callee.type='MemberExpression'][callee.property.name='json'][callee.object.type='CallExpression'][callee.object.callee.name='fetchWithIdentity']",
+          message: "Use apiRequest() for JSON API calls instead of fetchWithIdentity().json().",
+        },
+        {
+          selector: "CallExpression[callee.type='MemberExpression'][callee.property.name='json'][callee.object.type='AwaitExpression'][callee.object.argument.callee.name='fetchWithIdentity']",
+          message: "Use apiRequest() for JSON API calls instead of (await fetchWithIdentity()).json().",
+        },
+      ],
     }
   }
 ];

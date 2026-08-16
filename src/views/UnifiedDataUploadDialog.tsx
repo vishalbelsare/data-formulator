@@ -2,8 +2,12 @@
 // Licensed under the MIT License.
 
 import * as React from 'react';
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
+import { borderColor, transition, radius } from '../app/tokens';
+import { dialogHeight, dialogWidth, iconVar, textVar } from '../app/layout';
 import {
+    Alert,
+    AlertTitle,
     Box,
     Button,
     Chip,
@@ -22,32 +26,46 @@ import {
 
 import CloseIcon from '@mui/icons-material/Close';
 import UploadFileIcon from '@mui/icons-material/UploadFile';
-import ContentPasteIcon from '@mui/icons-material/ContentPaste';
-import LinkIcon from '@mui/icons-material/Link';
-import StorageIcon from '@mui/icons-material/Storage';
-import ImageSearchIcon from '@mui/icons-material/ImageSearch';
-import ExploreIcon from '@mui/icons-material/Explore';
+import { StreamIcon, getConnectorIcon, connectorSortOrder } from '../icons';
 import RestartAltIcon from '@mui/icons-material/RestartAlt';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
+import AddIcon from '@mui/icons-material/Add';
+import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
+import HistoryIcon from '@mui/icons-material/History';
+import BoltOutlinedIcon from '@mui/icons-material/BoltOutlined';
 import Paper from '@mui/material/Paper';
+import CircularProgress from '@mui/material/CircularProgress';
 
-import StreamIcon from '@mui/icons-material/Stream';
 import { useDispatch, useSelector } from 'react-redux';
-import { DataFormulatorState, dfActions, fetchFieldSemanticType } from '../app/dfSlice';
+import { DataFormulatorState, dfActions, dfSelectors } from '../app/dfSlice';
 import { AppDispatch } from '../app/store';
-import { DataSourceConfig, DictTable } from '../components/ComponentType';
-import { createTableFromFromObjectArray, createTableFromText, loadTextDataWrapper, loadBinaryDataWrapper } from '../data/utils';
+import { loadTable } from '../app/tableThunks';
+import { DataSourceConfig, DictTable, ConnectorAuthPath, ConnectorInstance } from '../components/ComponentType';
+import { createTableFromFromObjectArray, createTableFromText, loadTextDataWrapper, loadBinaryDataWrapper, readFileText } from '../data/utils';
 import { DataLoadingChat } from './DataLoadingChat';
-import { DatasetSelectionView, DatasetMetadata } from './TableSelectionView';
-import { getUrls } from '../app/utils';
-import { DBManagerPane } from './DBTableManager';
+import { ScrollFadeContainer } from '../components/ScrollFade';
+import { AnimatedAgentToyIcon } from './AgentToyIcon';
+import { AgentChatInput } from './AgentChatInput';
+import { buildDataLoadingSuggestions, buildDataLoadingQuickActions } from './dataLoadingSuggestions';
+import { getUrls, CONNECTOR_URLS } from '../app/utils';
+import { apiRequest } from '../app/apiClient';
+import { deriveConnectorDisplayName } from '../app/connectorNames';
+import { generateUUID } from '../app/identity';
+import { DataLoaderForm } from './DBTableManager';
 import { MultiTablePreview } from './MultiTablePreview';
 import { 
-    FormControlLabel, 
-    Switch
+    Checkbox,
+    FormControlLabel,
+    Switch,
 } from '@mui/material';
+import FolderOpenIcon from '@mui/icons-material/FolderOpen';
+import CreateNewFolderIcon from '@mui/icons-material/CreateNewFolder';
+import CloudIcon from '@mui/icons-material/Cloud';
+import LanguageIcon from '@mui/icons-material/Language';
+import { useTranslation } from 'react-i18next';
+import { LocalInstallUpgradePanel } from './LocalInstallUpgradePanel';
 
-export type UploadTabType = 'menu' | 'upload' | 'paste' | 'url' | 'database' | 'extract' | 'explore';
+export type UploadTabType = 'menu' | 'upload' | 'paste' | 'url' | 'database' | 'extract' | 'local-folder' | 'add-connection' | `connector:${string}`;
 
 interface TabPanelProps {
     children?: React.ReactNode;
@@ -72,6 +90,27 @@ function TabPanel(props: TabPanelProps) {
     );
 }
 
+// Collapse a filesystem path's home prefix to `~` for privacy / readability
+// (so screenshots and shared workspaces don't expose usernames). Recognizes
+// macOS (/Users/<u>/), Linux (/home/<u>/), and Windows (C:\Users\<u>\).
+// If `tail` is given, also keeps only the last N path segments, prefixed
+// with `…/` when truncated.
+const displayPath = (p: string, tail?: number): string => {
+    if (!p) return '';
+    let s = p.replace(/^\/Users\/[^/]+/, '~')
+             .replace(/^\/home\/[^/]+/, '~')
+             .replace(/^[A-Za-z]:\\Users\\[^\\]+/, '~');
+    if (tail && tail > 0) {
+        const sep = s.includes('\\') ? '\\' : '/';
+        const parts = s.split(sep).filter(Boolean);
+        if (parts.length > tail) {
+            const prefix = s.startsWith('~') ? '~' + sep : '';
+            s = (prefix || '…' + sep) + parts.slice(-tail).join(sep);
+        }
+    }
+    return s;
+};
+
 // Data source menu card component
 interface DataSourceCardProps {
     icon: React.ReactNode;
@@ -79,7 +118,21 @@ interface DataSourceCardProps {
     description: string;
     onClick: () => void;
     disabled?: boolean;
-    disabledReason?: string;
+    /**
+     *  - 'data'   (default) renders the standard data-source tile.
+     *  - 'action' renders a CTA-style card used by meta entries that
+     *    create a new connection (Add Connection, Link local folder).
+     */
+    variant?: 'data' | 'action';
+    badge?: React.ReactNode;
+    /** Optional hover tooltip; useful when `description` is truncated. */
+    tooltip?: React.ReactNode;
+    /**
+     * When true the pill icon carries a faint primary accent at rest,
+     * marking it as an active "add data" call-to-action. Navigation pills
+     * (already-connected sources) leave this off to stay fully neutral.
+     */
+    accent?: boolean;
 }
 
 const DataSourceCard: React.FC<DataSourceCardProps> = ({ 
@@ -88,10 +141,13 @@ const DataSourceCard: React.FC<DataSourceCardProps> = ({
     description, 
     onClick, 
     disabled = false,
-    disabledReason 
+    variant = 'data',
+    badge,
+    tooltip,
 }) => {
     const theme = useTheme();
-    
+    const isAction = variant === 'action';
+
     const card = (
         <Paper
             elevation={0}
@@ -99,17 +155,19 @@ const DataSourceCard: React.FC<DataSourceCardProps> = ({
             sx={{
                 p: 1.5,
                 cursor: disabled ? 'not-allowed' : 'pointer',
-                border: '1px solid',
-                borderColor: 'divider',
-                borderRadius: 1,
+                // 'action' cards (e.g. Add Connection, Link local folder)
+                // create new connectors. A dashed outline reads as "empty
+                // slot to fill" — a clearer affordance than another solid
+                // tile sitting next to real data sources.
+                border: `1px ${isAction ? 'dashed' : 'solid'} ${borderColor.divider}`,
+                borderRadius: radius.sm,
                 opacity: disabled ? 0.5 : 1,
-                transition: 'all 0.15s ease',
                 display: 'flex',
                 alignItems: 'center',
                 gap: 1.5,
                 '&:hover': disabled ? {} : {
-                    borderColor: 'primary.main',
-                    backgroundColor: alpha(theme.palette.primary.main, 0.04),
+                    transform: 'translateY(-2px)',
+                    backgroundColor: 'action.hover',
                 }
             }}
         >
@@ -123,20 +181,23 @@ const DataSourceCard: React.FC<DataSourceCardProps> = ({
                 borderRadius: 1,
                 backgroundColor: alpha(theme.palette.primary.main, 0.08),
                 flexShrink: 0,
-                '& .MuiSvgIcon-root': { fontSize: 18 }
+                '& .MuiSvgIcon-root': { fontSize: iconVar.lg }
             }}>
                 {icon}
             </Box>
             <Box sx={{ flex: 1, minWidth: 0 }}>
-                <Typography 
-                    variant="body2" 
-                    sx={{ 
-                        fontWeight: 500,
-                        color: disabled ? 'text.disabled' : 'text.primary',
-                    }}
-                >
-                    {title}
-                </Typography>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                    <Typography 
+                        variant="body2" 
+                        sx={{ 
+                            fontWeight: 500,
+                            color: disabled ? 'text.disabled' : 'text.primary',
+                        }}
+                    >
+                        {title}
+                    </Typography>
+                    {badge}
+                </Box>
                 <Typography
                     variant="caption"
                     sx={{
@@ -155,15 +216,87 @@ const DataSourceCard: React.FC<DataSourceCardProps> = ({
         </Paper>
     );
 
-    if (disabled && disabledReason) {
-        return (
-            <Tooltip title={disabledReason} placement="top">
-                <span>{card}</span>
-            </Tooltip>
-        );
-    }
+    return tooltip
+        ? <Tooltip title={tooltip} placement="top" arrow>{card}</Tooltip>
+        : card;
+};
 
-    return card;
+// Text-link variant of a source affordance. Used across the chat-focused
+// landing so every source/action reads as a single, lightweight link style
+// (an existing source, an "add connection" action, or a one-off upload)
+// rather than a mix of pills and links competing with the composer.
+// `accent` marks an entry with a faint primary icon at rest.
+/** Landing hero column: the composer and the source rows share this edge. */
+const HERO_WIDTH = 800;
+
+const SourceLink: React.FC<DataSourceCardProps> = ({
+    icon,
+    title,
+    description,
+    onClick,
+    disabled = false,
+    accent = false,
+    tooltip,
+}) => {
+    const theme = useTheme();
+    const link = (
+        <Box
+            component="button"
+            type="button"
+            onClick={disabled ? undefined : onClick}
+            disabled={disabled}
+            sx={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 0.5,
+                p: 0,
+                border: 'none',
+                background: 'none',
+                font: 'inherit',
+                maxWidth: '100%',
+                minWidth: 0,
+                cursor: disabled ? 'not-allowed' : 'pointer',
+                opacity: disabled ? 0.5 : 1,
+                color: accent ? 'primary.main' : alpha(theme.palette.text.primary, 0.76),
+                transition: 'color 120ms ease',
+                '&:hover': disabled ? {} : {
+                    color: 'primary.main',
+                    '& .SourceLink-title': { textDecoration: 'underline', textUnderlineOffset: 2 },
+                },
+            }}
+        >
+            <Box sx={{
+                display: 'flex',
+                alignItems: 'center',
+                color: 'inherit',
+                flexShrink: 0,
+                '& .MuiSvgIcon-root': { fontSize: iconVar.md },
+            }}>
+                {icon}
+            </Box>
+            <Typography
+                component="span"
+                className="SourceLink-title"
+                sx={{
+                    fontWeight: 400,
+                    fontSize: '0.8125rem',
+                    lineHeight: 1.4,
+                    color: 'inherit',
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    minWidth: 0,
+                }}
+            >
+                {title}
+            </Typography>
+        </Box>
+    );
+
+    const tip = tooltip ?? (description || null);
+    return tip
+        ? <Tooltip title={tip} placement="top" arrow>{link}</Tooltip>
+        : link;
 };
 
 const getUniqueTableName = (baseName: string, existingNames: Set<string>): string => {
@@ -176,274 +309,923 @@ const getUniqueTableName = (baseName: string, existingNames: Set<string>): strin
     return uniqueName;
 };
 
+// ── Local Folder Panel ──────────────────────────────────────────────────
+// Simple panel: "Select Folder" button + "Recursive" checkbox.
+// Creates a connector behind the scenes, then jumps to the connector tab.
+
+interface LocalFolderPanelProps {
+    onConnectorCreated: (conn: ConnectorInstance) => void;
+}
+
+export const LocalFolderPanel: React.FC<LocalFolderPanelProps> = ({ onConnectorCreated }) => {
+    const { t } = useTranslation();
+    const theme = useTheme();
+    const [recursive, setRecursive] = React.useState(true);
+    const [loading, setLoading] = React.useState(false);
+    const [error, setError] = React.useState<string | null>(null);
+    const [selectedPath, setSelectedPath] = React.useState<string | null>(null);
+    const [showManualInput, setShowManualInput] = React.useState(false);
+    const [manualPath, setManualPath] = React.useState('');
+
+    // Create connector from a given path
+    const connectFolder = async (folderPath: string) => {
+        setError(null);
+        setLoading(true);
+        try {
+            const folderName = folderPath.split('/').pop() || folderPath.split('\\').pop() || t('upload.localFolderDefaultName', { defaultValue: 'Local Folder' });
+            const { data: createData } = await apiRequest<any>(CONNECTOR_URLS.CREATE, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    loader_type: 'local_folder',
+                    display_name: folderName,
+                    params: {
+                        root_dir: folderPath,
+                        recursive: recursive ? 'true' : 'false',
+                    },
+                }),
+            });
+
+            const { data: listData } = await apiRequest<any>(CONNECTOR_URLS.LIST, { method: 'GET' });
+            const newConn = (listData.connectors || []).find((c: ConnectorInstance) => c.id === createData.id);
+            if (newConn) {
+                onConnectorCreated(newConn);
+            }
+        } catch (err: any) {
+            setError(err.message || t('upload.errors.failedToConnectFolder', { defaultValue: 'Failed to connect folder' }));
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const handleSelectFolder = async () => {
+        setError(null);
+        setLoading(true);
+        try {
+            let pickData: any;
+            try {
+                const result = await apiRequest<any>('/api/local/pick-directory', { method: 'POST' });
+                pickData = result.data;
+            } catch (err: any) {
+                if (err?.apiError?.code === 'FALLBACK_TEXT_INPUT' || err?.httpStatus === 501) {
+                    setShowManualInput(true);
+                    setLoading(false);
+                    return;
+                }
+                throw err;
+            }
+            if (!pickData.path) {
+                setLoading(false);
+                return; // user cancelled
+            }
+            setSelectedPath(pickData.path);
+            await connectFolder(pickData.path);
+        } catch (err: any) {
+            setError(err.message || t('upload.errors.failedToOpenFolder', { defaultValue: 'Failed to open folder' }));
+            setShowManualInput(true);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const handleManualConnect = async () => {
+        const trimmed = manualPath.trim();
+        if (!trimmed) return;
+        setSelectedPath(trimmed);
+        await connectFolder(trimmed);
+    };
+
+    return (
+        <Box sx={{
+            display: 'flex',
+            flexDirection: 'column',
+            height: '100%',
+            boxSizing: 'border-box',
+            gap: 2,
+            p: 3,
+            justifyContent: 'center',
+            alignItems: 'center',
+        }}>
+            <Box sx={{
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                gap: 2,
+                maxWidth: 420,
+                width: '100%',
+            }}>
+                <FolderOpenIcon sx={{ fontSize: 48, color: 'text.secondary', opacity: 0.5 }} />
+                <Typography variant="body1" color="text.secondary" textAlign="center">
+                    {t('upload.localFolderHint', { defaultValue: 'Select a folder on your computer to browse and import data files.' })}
+                </Typography>
+
+                <FormControlLabel
+                    control={
+                        <Checkbox
+                            checked={recursive}
+                            onChange={(e) => setRecursive(e.target.checked)}
+                            size="small"
+                        />
+                    }
+                    label={
+                        <Typography variant="body2">
+                            {t('upload.includeSubfolders', { defaultValue: 'Include subfolders' })}
+                        </Typography>
+                    }
+                />
+
+                {showManualInput ? (
+                    /* Text input fallback when native dialog is unavailable */
+                    <Box sx={{ display: 'flex', gap: 1, width: '100%', alignItems: 'flex-start' }}>
+                        <TextField
+                            fullWidth
+                            size="small"
+                            placeholder={t('upload.folderPathPlaceholder', { defaultValue: '/path/to/your/data/folder' })}
+                            value={manualPath}
+                            onChange={(e) => setManualPath(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === 'Enter') handleManualConnect(); }}
+                            sx={{ '& .MuiInputBase-input': { fontSize: '0.875rem' } }}
+                        />
+                        <Button
+                            variant="contained"
+                            onClick={handleManualConnect}
+                            disabled={loading || !manualPath.trim()}
+                            startIcon={loading ? <CircularProgress size={16} color="inherit" /> : undefined}
+                            sx={{ textTransform: 'none', whiteSpace: 'nowrap' }}
+                        >
+                            {t('upload.connect', { defaultValue: 'Connect' })}
+                        </Button>
+                    </Box>
+                ) : (
+                    <Button
+                        variant="contained"
+                        onClick={handleSelectFolder}
+                        disabled={loading}
+                        startIcon={loading ? <CircularProgress size={16} color="inherit" /> : <FolderOpenIcon />}
+                        sx={{ textTransform: 'none', px: 3, py: 1 }}
+                    >
+                        {loading
+                            ? t('upload.opening', { defaultValue: 'Opening...' })
+                            : t('upload.selectFolder', { defaultValue: 'Select Folder' })}
+                    </Button>
+                )}
+
+                {/* Allow switching to manual input */}
+                {!showManualInput && (
+                    <Link
+                        component="button"
+                        variant="caption"
+                        color="text.secondary"
+                        onClick={() => setShowManualInput(true)}
+                        sx={{ fontSize: '0.75rem', textDecoration: 'none', '&:hover': { textDecoration: 'underline' } }}
+                    >
+                        {t('upload.orTypePath', { defaultValue: 'or type a path manually' })}
+                    </Link>
+                )}
+
+                {error && (
+                    <Typography variant="body2" color="error" textAlign="center" sx={{ mt: 1 }}>
+                        {error}
+                    </Typography>
+                )}
+            </Box>
+        </Box>
+    );
+};
+
+// Re-export ConnectorInstance from shared types for backward compatibility
+export { type ConnectorInstance } from '../components/ComponentType';
+
+// Map connector source_type (class name) to i18n key suffix
+const CONNECTOR_TYPE_KEY_MAP: Record<string, string> = {
+    SampleDatasetsLoader: 'sample_datasets',
+    MySQLDataLoader: 'mysql',
+    PostgreSQLDataLoader: 'postgresql',
+    MSSQLDataLoader: 'mssql',
+    CosmosDBDataLoader: 'cosmosdb',
+    MongoDBDataLoader: 'mongodb',
+    BigQueryDataLoader: 'bigquery',
+    AthenaDataLoader: 'athena',
+    KustoDataLoader: 'kusto',
+    SupersetLoader: 'superset',
+    AzureBlobDataLoader: 'azure_blob',
+    S3DataLoader: 's3',
+    LocalFolderDataLoader: 'local_folder',
+};
+
+function getConnectorTypeDescription(sourceType: string, connected: boolean, t: (key: string, options?: any) => string): string {
+    const keySuffix = CONNECTOR_TYPE_KEY_MAP[sourceType];
+    if (keySuffix) {
+        const typeDesc = t(`upload.connectorDesc.${keySuffix}`);
+        return connected ? typeDesc : t('upload.connectorDisconnected', { defaultValue: 'Not connected' });
+    }
+    return connected
+        ? sourceType || t('upload.connectorConnected', { defaultValue: 'Connected' })
+        : t('upload.connectorDisconnected', { defaultValue: 'Not connected' });
+}
+
 // Reusable Data Load Menu Component
 export interface DataLoadMenuProps {
     onSelectTab: (tab: UploadTabType) => void;
-    serverConfig?: { DISABLE_DATABASE?: boolean };
-    variant?: 'dialog' | 'page'; // 'dialog' uses smaller cards, 'page' uses larger cards
+    /**
+     * Optional override for connector-card clicks. When provided, clicking a
+     * `connector:${id}` card calls this with the full `ConnectorInstance`
+     * instead of routing through `onSelectTab`. Used by the dialog/page so
+     * already-connected connectors hand off to the data-source sidebar
+     * instead of opening an in-dialog catalog tab.
+     */
+    onSelectConnector?: (connector: ConnectorInstance) => void;
+    /**
+     * Called when the user submits a prompt from the top-level Data Loading
+     * Agent chat box. Implementations should hand the payload off to the
+     * agent chat surface, which will auto-send it as a fresh user
+     * message. Attachments are file names (already uploaded to the
+     * session scratch space) — the chat surface re-injects them as
+     * `[Uploaded: name]` mentions when building the backend payload.
+     * If not provided, the chat box falls back to `onSelectTab('extract')`.
+     */
+    onStartChat?: (prompt: string, images: string[], attachments: string[]) => void;
+    /**
+     * True when a prior data-loading agent conversation exists in
+     * state. When set together with `onResumeChat`, the menu renders
+     * a small "Resume previous" affordance next to the agent label so
+     * the user can re-open the previous thread instead of being forced
+     * to overwrite it with a new query.
+     */
+    hasPriorConversation?: boolean;
+    /**
+     * Called when the user clicks the "Resume previous" affordance.
+     * Should open the agent chat surface without clearing the existing
+     * message history and without auto-sending anything.
+     */
+    onResumeChat?: () => void;
+    serverConfig?: { WORKSPACE_BACKEND?: string; IS_LOCAL_MODE?: boolean };
+    connectors?: ConnectorInstance[];
 }
 
 export const DataLoadMenu: React.FC<DataLoadMenuProps> = ({ 
     onSelectTab, 
-    serverConfig = { DISABLE_DATABASE: false },
-    variant = 'dialog'
+    onSelectConnector,
+    onStartChat,
+    hasPriorConversation = false,
+    onResumeChat,
+    serverConfig = { WORKSPACE_BACKEND: 'local' },
+    connectors = [],
 }) => {
     const theme = useTheme();
-    // Data source configurations
-    const regularDataSources = [
-        { 
-            value: 'explore' as UploadTabType, 
-            title: 'Sample Datasets', 
-            description: 'Explore and load curated example datasets',
-            icon: <ExploreIcon />, 
+    const { t } = useTranslation();
+    const dispatch = useDispatch<AppDispatch>();
+    const activeWorkspace = useSelector((state: DataFormulatorState) => state.activeWorkspace);
+    // Backend requires an active workspace (X-Workspace-Id header) for
+    // scratch uploads and chat. The menu can be opened on the entry
+    // surface before any workspace has been picked, so we lazily mint
+    // one here — the parent's `openUploadDialog` does the same when it
+    // can, but we cover the path where this menu is rendered directly.
+    const ensureActiveWorkspace = (): string => {
+        if (activeWorkspace?.id) return activeWorkspace.id;
+        const now = new Date();
+        const date = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
+        const time = `${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`;
+        const wsId = `session_${date}_${time}_${generateUUID().slice(0, 4)}`;
+        dispatch(dfActions.setActiveWorkspace({ id: wsId, displayName: 'Untitled Session' }));
+        return wsId;
+    };
+    // One-off file upload is surfaced as an "Upload data" action in the
+    // connected-sources row (see `connectorActionSources`). Paste Data and
+    // Load from URL used to live here too, but they are now subsumed by the
+    // Data Loading Agent chat box at the top of the menu (paste text into the
+    // prompt; the agent's fetch_url loads any URL). Sample datasets are
+    // exposed as the built-in `sample_datasets` connector below.
+
+    // Data connections — persistent configured sources (databases, services, etc.)
+    const connectionSources: Array<{ value: UploadTabType; title: string; description: string; icon: React.ReactNode; disabled: boolean; variant?: 'data' | 'action'; tooltip?: React.ReactNode }> = [
+        // Per-connector cards — all instances
+        ...connectors.map((conn) => {
+            const isLocalFolder = conn.source_type === 'LocalFolderDataLoader' || conn.id.startsWith('local_folder');
+            const folderPath = isLocalFolder ? (conn.pinned_params?.root_dir || '') : '';
+            // Show only the tail of the path on the card (privacy-friendly
+            // for screenshots), with the home-collapsed full path on hover.
+            const folderDisplay = displayPath(folderPath, 2);
+            const folderTooltip = displayPath(folderPath);
+            const isConnected = !!conn.connected || !!conn.sso_auto_connect;
+            const statusLabel = isConnected
+                ? t('upload.connectorConnected')
+                : t('upload.connectorDisconnected');
+            const detail = isLocalFolder
+                ? (folderDisplay || t('upload.localFolderConnected', { defaultValue: 'Local folder' }))
+                : getConnectorTypeDescription(conn.source_type, conn.connected, t);
+            return {
+                value: `connector:${conn.id}` as UploadTabType,
+                title: conn.display_name,
+                description: detail,
+                // The label already names the source, so the glyph carries the
+                // one thing it can't: whether we can reach it.
+                icon: (
+                    <Box sx={{
+                        width: 7, height: 7, borderRadius: '50%', flexShrink: 0,
+                        bgcolor: isConnected ? 'success.main' : 'error.main',
+                    }} />
+                ),
+                disabled: false,
+                tooltip: `${statusLabel}${detail ? ` · ${detail}` : ''}${isLocalFolder && folderTooltip ? ` · ${folderTooltip}` : ''}`,
+            };
+        }),
+    ];
+
+    // "Add data" actions shown to the right of the connected sources (after a
+    // divider): one-off file upload, link a local folder, add a database.
+    const connectorActionSources: Array<{ value: UploadTabType; title: string; description: string; icon: React.ReactNode; disabled: boolean; variant?: 'data' | 'action' }> = [
+        // One-off file upload — fast, deterministic path that skips the agent.
+        {
+            value: 'upload' as UploadTabType,
+            title: t('upload.uploadData', { defaultValue: 'Upload data' }),
+            description: t('upload.uploadFileDesc'),
+            icon: <UploadFileIcon />,
             disabled: false,
-            disabledReason: undefined
+            variant: 'action' as const,
         },
-        { 
-            value: 'upload' as UploadTabType, 
-            title: 'Upload File', 
-            description: 'Upload local files (CSV, TSV, JSON, Excel)',
-            icon: <UploadFileIcon />, 
+        // "Local Folder" card (action variant, local mode only)
+        ...(serverConfig?.IS_LOCAL_MODE ? [{
+            value: 'local-folder' as UploadTabType,
+            title: t('upload.localFolder', { defaultValue: 'Link local folder' }),
+            description: t('upload.localFolderDesc', { defaultValue: 'Connect to a local folder for fast imports' }),
+            icon: <CreateNewFolderIcon />,
             disabled: false,
-            disabledReason: undefined
-        },
-        { 
-            value: 'paste' as UploadTabType, 
-            title: 'Paste Data', 
-            description: 'Paste tabular data directly from clipboard',
-            icon: <ContentPasteIcon />, 
+            variant: 'action' as const,
+        }] : []),
+        // "Add Connection" card (action variant)
+        {
+            value: 'add-connection' as UploadTabType,
+            title: t('upload.addConnection', { defaultValue: 'Connect databases' }),
+            description: t('upload.addConnectionDesc', { defaultValue: 'Create a persistent database connection' }),
+            icon: <AddIcon />,
             disabled: false,
-            disabledReason: undefined
-        },
-        { 
-            value: 'extract' as UploadTabType, 
-            title: 'Extract Unstructured Data', 
-            description: 'Extract tables from images or text using AI',
-            icon: <ImageSearchIcon />, 
-            disabled: false,
-            disabledReason: undefined
+            variant: 'action' as const,
         },
     ];
 
-    const liveDataSources = [
-        { 
-            value: 'url' as UploadTabType, 
-            title: 'Load from URL', 
-            description: 'Load data from a URL with optional auto-refresh',
-            icon: <LinkIcon />, 
-            disabled: false,
-            disabledReason: undefined
-        },
-        { 
-            value: 'database' as UploadTabType, 
-            title: 'Database', 
-            description: 'Connect to databases or data services',
-            icon: <StorageIcon />, 
-            disabled: serverConfig.DISABLE_DATABASE,
-            disabledReason: 'Database connection is disabled in this environment'
-        },
-    ];
+    // Route connector-card clicks to onSelectConnector when provided so the
+    // dialog/page can hand off to the data-source sidebar instead of opening
+    // an in-dialog catalog tab. Non-connector cards always go through
+    // onSelectTab.
+    const handleConnectionClick = (sourceValue: UploadTabType) => {
+        if (typeof sourceValue === 'string' && sourceValue.startsWith('connector:') && onSelectConnector) {
+            const connId = sourceValue.slice('connector:'.length);
+            const conn = connectors.find(c => c.id === connId);
+            if (conn) {
+                onSelectConnector(conn);
+                return;
+            }
+        }
+        onSelectTab(sourceValue);
+    };
 
-    if (variant === 'page') {
-        // Page variant: 3-column grid, first column for liveDataSources, second 2 columns for regularDataSources
-        return (
-            <Box sx={{ 
-                width: '100%',
-                display: 'grid',
-                gridTemplateColumns: 'minmax(0, 1fr) repeat(2, minmax(0, 1fr))',
-                gridTemplateRows: 'auto repeat(2, auto)',
-                gap: 1.5,
-                rowGap: 2,
-                mx: 0,
-                textAlign: 'left',
-            }}>
-                {/* Section Titles */}
-                <Typography 
-                    variant="body2" 
-                    color="text.secondary" 
-                    sx={{ 
-                        gridColumn: 1,
-                        gridRow: 1,
-                        textAlign: 'left',
-                        letterSpacing: '0.02em',
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: 1,
-                        position: 'relative',
-                        zIndex: 1,
-                        marginRight: 3, // Extra space between first column and other columns
-                    }}
-                >
-                    <StreamIcon sx={{ fontSize: 14, animation: 'pulse 2s infinite', '@keyframes pulse': {
-                        '0%': { opacity: 1, color: 'primary.main' },
-                        '50%': { opacity: 0.5, color: 'primary.light' },
-                        '100%': { opacity: 1, color: 'primary.main' },
-                    }, }} /> Connect to live data sources
-                </Typography>
-                <Typography 
-                    variant="body2" 
-                    color="text.secondary" 
-                    sx={{ 
-                        gridColumn: '2 / 3',
-                        gridRow: 1,
-                        textAlign: 'left',
-                        letterSpacing: '0.02em'
-                    }}
-                >
-                    Load local data
-                </Typography>
-                
-                {/* Background for Live Data Column */}
-                <Box
-                    sx={{
-                        gridColumn: 1,
-                        gridRow: '1 / -1',
-                        backgroundColor: alpha(theme.palette.primary.main, 0.03),
-                        borderRadius: 1,
-                        position: 'relative',
-                        zIndex: 0,
-                        // Extend into gaps to create continuous background
-                        marginTop: '-16px', // Extend into row gaps (2 * 8px = 16px)
-                        marginBottom: '-16px',
-                        marginLeft: '-12px', // Extend into left column gap (1.5 * 8px = 12px)
-                        marginRight: '12px', // Extra space between first column and other columns (3 * 8px = 24px total)
-                        paddingTop: '16px',
-                        paddingBottom: '16px',
-                        paddingLeft: '12px',
-                        paddingRight: '12px',
-                    }}
-                />
-                
-                {/* Live Data Sources - fill last column, 2 rows */}
-                {liveDataSources.map((source, index) => (
-                    <Box
-                        key={source.value}
+    // ------------------------------------------------------------------
+    // Data Loading Agent quick-chat box. Surfaced at the top of the menu
+    // so users can start a conversation with the agent directly. Pressing
+    // Enter (or the send button) hands the prompt/images off to the chat
+    // surface via `onStartChat`, which opens the agent and auto-sends.
+    // Falls back to `onSelectTab('extract')` if no handler is provided.
+    // ------------------------------------------------------------------
+    const [agentInput, setAgentInput] = useState('');
+    const [agentImages, setAgentImages] = useState<string[]>([]);
+    const [agentAttachments, setAgentAttachments] = useState<string[]>([]);
+    const submitAgentChat = () => {
+        const text = agentInput.trim();
+        if (text.length === 0 && agentImages.length === 0 && agentAttachments.length === 0) {
+            // Empty submission — just surface the chat.
+            if (onStartChat) onStartChat('', [], []);
+            else onSelectTab('extract');
+            return;
+        }
+        // Pass payload pieces unchanged — the chat surface builds the
+        // backend mentions itself. We deliberately do NOT pre-inject
+        // `[Uploaded: name]` into `text` here, so the visible message
+        // bubble stays clean and the file chips render uniformly.
+        if (onStartChat) {
+            onStartChat(text, agentImages, agentAttachments);
+        } else {
+            onSelectTab('extract');
+        }
+        setAgentInput('');
+        setAgentImages([]);
+        setAgentAttachments([]);
+    };
+
+    // Suggestions surfaced as a focus-time dropdown — sourced from a shared
+    // factory so the in-session `DataLoadingChat` panel renders the exact
+    // same list. See `dataLoadingSuggestions.ts`. Auto-run is routed
+    // through `onStartChat` so the parent dialog can dispatch its
+    // `clearChatMessages` + `setDataLoadingChatPending` sequence
+    // atomically — same path as a manual submit.
+    const agentChatSuggestions = useMemo(() => buildDataLoadingSuggestions({
+        t,
+        setInput: setAgentInput,
+        setImages: setAgentImages,
+        setAttachments: setAgentAttachments,
+        ensureActiveWorkspace,
+        requestAutoSend: onStartChat
+            ? (payload) => {
+                  onStartChat(payload.text, payload.images, payload.attachments);
+                  setAgentInput('');
+                  setAgentImages([]);
+                  setAgentAttachments([]);
+              }
+            : undefined,
+         
+    }), [t, onStartChat]);
+    const quickActions = useMemo(() => buildDataLoadingQuickActions({
+        t,
+        setInput: setAgentInput,
+        setImages: setAgentImages,
+        setAttachments: setAgentAttachments,
+        requestAutoSend: onStartChat
+            ? (payload) => {
+                  onStartChat(payload.text, payload.images, payload.attachments);
+                  setAgentInput('');
+                  setAgentImages([]);
+                  setAgentAttachments([]);
+              }
+            : undefined,
+         
+    }), [t, onStartChat]);
+    const agentChatBox = (
+        <Box sx={{ display: 'flex', flexDirection: 'column', width: '100%', maxWidth: HERO_WIDTH, alignSelf: 'center' }}>
+            <Box sx={{ mb: 1.75, display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 0.75, rowGap: 0.75 }}>
+                {quickActions.map((qa) => (
+                    <Chip
+                        key={qa.kind}
+                        icon={<BoltOutlinedIcon />}
+                        label={qa.label}
+                        onClick={qa.onClick}
+                        disabled={activeWorkspace?.readOnly === true}
+                        variant="outlined"
+                        size="small"
                         sx={{
-                            gridColumn: 1,
-                            gridRow: index + 2, // Start from row 2 (after title row)
-                            position: 'relative',
-                            zIndex: 1,
-                            marginRight: 3, // Extra space between first column and other columns
+                            fontSize: textVar.md, height: 30, borderRadius: 2,
+                            color: alpha(theme.palette.text.primary, 0.78),
+                            borderColor: alpha(theme.palette.text.primary, 0.22),
+                            backgroundColor: alpha(theme.palette.background.paper, 0.72),
+                            '& .MuiChip-icon': { fontSize: textVar.xl, ml: 0.5, color: alpha(theme.palette.text.primary, 0.55) },
+                            '&:hover': {
+                                bgcolor: alpha(theme.palette.primary.main, 0.06),
+                                borderColor: alpha(theme.palette.primary.main, 0.4),
+                            },
                         }}
-                    >
-                        <DataSourceCard
-                            icon={source.icon}
-                            title={source.title}
-                            description={source.description}
-                            onClick={() => onSelectTab(source.value)}
-                            disabled={source.disabled}
-                            disabledReason={source.disabledReason}
-                        />
-                    </Box>
+                    />
                 ))}
-                {/* Regular Data Sources - fill first 2 columns, 2 rows */}
-                {regularDataSources.map((source, index) => (
-                    <Box
-                        key={source.value}
-                        sx={{
-                            gridColumn: (index % 2) + 2,
-                            gridRow: Math.floor(index / 2) + 2, // Start from row 2 (after title row)
-                        }}
-                    >
-                        <DataSourceCard
-                            icon={source.icon}
-                            title={source.title}
-                            description={source.description}
-                            onClick={() => onSelectTab(source.value)}
-                            disabled={source.disabled}
-                            disabledReason={source.disabledReason}
-                        />
-                    </Box>
-                ))}
-                
             </Box>
-        );
-    }
+            <AgentChatInput
+                value={agentInput}
+                onChange={setAgentInput}
+                images={agentImages}
+                onImagesChange={setAgentImages}
+                onSend={submitAgentChat}
+                disabled={activeWorkspace?.readOnly === true}
+                layout="stacked"
+                sx={{
+                    // Landing hero: a gentle lift + faint primary-tinted
+                    // border so it reads as the focal point without visually
+                    // crowding the chips above / source rows below. Focus-within
+                    // still escalates to the component's default primary ring.
+                    borderColor: alpha(theme.palette.primary.main, 0.38),
+                    boxShadow: '0 5px 18px rgba(32, 33, 36, 0.11), 0 1px 4px rgba(32, 33, 36, 0.07)',
+                    '&:hover': {
+                        boxShadow: '0 6px 20px rgba(32, 33, 36, 0.11), 0 2px 6px rgba(32, 33, 36, 0.06)',
+                    },
+                }}
+                leadingSlot={hasPriorConversation && onResumeChat ? (
+                    <Tooltip title={t('upload.resumePreviousConversation', { defaultValue: 'Previous conversation' })}>
+                        <IconButton size="small" onClick={onResumeChat} sx={{ color: 'text.secondary', '&:hover': { color: 'text.primary' } }}>
+                            <HistoryIcon sx={{ fontSize: iconVar.lg }} />
+                        </IconButton>
+                    </Tooltip>
+                ) : undefined}
+                onNonImageFile={(file) => {
+                    // Upload non-image files (Excel, CSV, JSON, …) to the
+                    // session scratch space. The filename is shown as a
+                    // chip; the `[Uploaded: name]` mention is appended to
+                    // the outgoing prompt at send-time so the editable
+                    // input stays clean.
+                    ensureActiveWorkspace();
+                    const formData = new FormData();
+                    formData.append('file', file);
+                    apiRequest(getUrls().SCRATCH_UPLOAD_URL, {
+                        method: 'POST', body: formData,
+                    }).then(({ data }) => {
+                        // The backend hash-suffixes the filename; store the
+                        // server-assigned name so the `[Uploaded:]` mention
+                        // resolves to the real scratch file.
+                        const scratchName = (data?.path || `scratch/${file.name}`).replace(/^scratch\//, '');
+                        setAgentAttachments(prev => [...prev, scratchName]);
+                    }).catch(err => console.error('Upload failed:', err));
+                }}
+                attachments={agentAttachments}
+                onAttachmentsChange={setAgentAttachments}
+                minRows={3}
+                tabSuggestion={t('upload.agentChatTabSuggestion', {
+                    defaultValue: 'What dataset do we have here?',
+                })}
+                focusSuggestionsLabel={t('upload.agentChatSuggestionsLabel', { defaultValue: 'Try asking' })}
+                focusSuggestions={agentChatSuggestions}
+                placeholder={t('upload.agentChatPlaceholder', {
+                    defaultValue: 'Ask the agent to find datasets, or extract data from an image or text…',
+                })}
+                sendTooltip={t('upload.agentChatSendTooltip', { defaultValue: 'Start chatting with the agent' })}
+            />
+        </Box>
+    );
 
-    // Dialog variant: original two-section layout
     return (
         <Box sx={{ 
             width: '100%',
-            maxWidth: 860,
             display: 'flex',
             flexDirection: 'column',
-            gap: 2,
+            gap: 4,
             mx: 0,
             textAlign: 'left',
         }}>
-            {/* Local Data Sources */}
-            <Typography 
-                variant="body2" 
-                color="text.secondary" 
-                sx={{ 
-                    textAlign: 'left',
-                    mb: 1,
-                    mt: 1,
-                    opacity: 0.6,
-                    fontSize: '0.75rem',
-                    letterSpacing: '0.02em'
-                }}
-            >
-                Local data
-            </Typography>
+            {/* Data Loading Agent quick-chat — the hero of this surface */}
+            {agentChatBox}
 
-            <Box sx={{ 
-                display: 'grid', 
-                gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
-                gap: 1.5,
-                mb: 0,
+            {/* Sources — same width as the chat box so they read as part of it */}
+            <Box sx={{ width: '100%', maxWidth: HERO_WIDTH, alignSelf: 'center', display: 'flex', flexDirection: 'column', gap: 1 }}>
+                {/* Row 1 — connected data sources (as lightweight links):
+                    the already-connected instances. The "add a connection"
+                    actions live on their own row below so they read as
+                    primary calls-to-action rather than list items. */}
+                <Box sx={{
+                    display: 'flex',
+                    flexWrap: 'wrap',
+                    alignItems: 'center',
+                    columnGap: 1.5,
+                    rowGap: 0.75,
+                }}>
+                    <Typography
+                        variant="body2"
+                        sx={{ fontSize: '0.8rem', fontWeight: 600, color: alpha(theme.palette.text.primary, 0.72), mr: 0.25, flexShrink: 0 }}
+                    >
+                        {t('upload.dataSourcesLabel', { defaultValue: 'Connected to:' })}
+                    </Typography>
+                    {connectionSources.map((source) => (
+                        <SourceLink
+                            key={source.value}
+                            icon={source.icon}
+                            title={source.title}
+                            description={source.description}
+                            onClick={() => handleConnectionClick(source.value)}
+                            disabled={source.disabled}
+                            tooltip={source.tooltip}
+                        />
+                    ))}
+                </Box>
+
+                {/* Row 2 — add-a-source actions: same muted link family as the
+                    connected sources, differentiated only by a subtle shaded
+                    background chip (no primary color). */}
+                <Box sx={{
+                    display: 'flex',
+                    flexWrap: 'wrap',
+                    alignItems: 'center',
+                    columnGap: 1,
+                    rowGap: 0.75,
+                }}>
+                    <Typography
+                        variant="body2"
+                        sx={{ fontSize: '0.8rem', fontWeight: 600, color: alpha(theme.palette.text.primary, 0.72), mr: 0.25, flexShrink: 0 }}
+                    >
+                        {t('upload.addSourceLabel', { defaultValue: 'Or add data directly:' })}
+                    </Typography>
+                    {connectorActionSources.map((source) => (
+                        <Box
+                            key={source.value}
+                            component="button"
+                            type="button"
+                            onClick={source.disabled ? undefined : () => handleConnectionClick(source.value)}
+                            disabled={source.disabled}
+                            title={source.description}
+                            sx={{
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: 0.5,
+                                px: 1,
+                                py: 0.375,
+                                border: `1px solid ${alpha(theme.palette.text.primary, 0.12)}`,
+                                borderRadius: 1,
+                                font: 'inherit',
+                                whiteSpace: 'nowrap',
+                                cursor: source.disabled ? 'not-allowed' : 'pointer',
+                                opacity: source.disabled ? 0.5 : 1,
+                                color: alpha(theme.palette.text.primary, 0.8),
+                                bgcolor: alpha(theme.palette.text.primary, 0.07),
+                                transition: 'background-color 120ms ease, color 120ms ease',
+                                '&:hover': source.disabled ? {} : {
+                                    bgcolor: alpha(theme.palette.primary.main, 0.08),
+                                    borderColor: alpha(theme.palette.primary.main, 0.3),
+                                    color: 'text.primary',
+                                },
+                                '& .MuiSvgIcon-root': { fontSize: iconVar.md },
+                            }}
+                        >
+                            {source.icon}
+                            <Typography
+                                component="span"
+                                sx={{
+                                    fontWeight: 400,
+                                    fontSize: '0.8125rem',
+                                    lineHeight: 1.4,
+                                    color: 'inherit',
+                                }}
+                            >
+                                {source.title}
+                            </Typography>
+                        </Box>
+                    ))}
+                </Box>
+            </Box>
+        </Box>
+    );
+};
+
+// ---------------------------------------------------------------------------
+// AddConnectionPanel — left sidebar lists loader types, right shows DataLoaderForm
+// ---------------------------------------------------------------------------
+
+interface LoaderType {
+    type: string;
+    name: string;
+    params: Array<{name: string; type: string; required: boolean; default?: string | number | boolean; options?: string[]; advanced?: boolean; description?: string; sensitive?: boolean; tier?: 'connection' | 'auth' | 'filter'}>;
+    hierarchy: Array<{key: string; label: string}>;
+    auth_mode?: string;
+    auth_paths?: ConnectorAuthPath[];
+    auth_instructions?: string;
+    delegated_login?: { login_url: string; label?: string; params?: string[] } | null;
+    source?: 'plugin' | 'builtin';
+    source_path?: string | null;
+}
+
+interface PluginsInfo {
+    dir: string;
+    enabled: boolean;
+    reason: string;
+    loaded: Array<{ type: string; name: string; source_path: string }>;
+    errors: Array<{ file: string; reason: string; kind: string }>;
+}
+
+const AddConnectionPanel: React.FC<{
+    onCreated: (connector: ConnectorInstance) => void;
+    initialType?: string;
+    onAskAgent?: (prompt: string) => void;
+}> = ({ onCreated, initialType, onAskAgent }) => {
+    const { t } = useTranslation();
+    const disableConnectors = useSelector(
+        (state: DataFormulatorState) => state.serverConfig.DISABLE_DATA_CONNECTORS,
+    );
+    const [loaderTypes, setLoaderTypes] = useState<LoaderType[]>([]);
+    const [disabledLoaders, setDisabledLoaders] = useState<Record<string, {install_hint: string}>>({});
+    const [pluginsInfo, setPluginsInfo] = useState<PluginsInfo | null>(null);
+    const [selectedType, setSelectedType] = useState<string>('');
+    const dispatch = useDispatch<AppDispatch>();
+    const identityKey = useSelector((state: DataFormulatorState) => `${state.identity.type}:${state.identity.id}`);
+    // Track the created connector ID so DataLoaderForm can use it
+    const createdIdRef = useRef<string | null>(null);
+
+    useEffect(() => {
+        createdIdRef.current = null;
+    }, [identityKey]);
+
+    // Fetch available loader types
+    useEffect(() => {
+        if (disableConnectors) return;
+        apiRequest<any>(CONNECTOR_URLS.DATA_LOADERS, { method: 'GET' })
+            .then(({ data }) => {
+                setLoaderTypes(data.loaders || []);
+                setDisabledLoaders(data.disabled || {});
+                setPluginsInfo(data.plugins || null);
+                if (data.loaders?.length > 0) {
+                    // Honor a requested pre-selection (e.g. the "Link local
+                    // folder" entry point) when that loader is available;
+                    // otherwise fall back to the first loader.
+                    const preferred = initialType
+                        ? data.loaders.find((l: LoaderType) => l.type === initialType)
+                        : undefined;
+                    const chosen = preferred || data.loaders[0];
+                    setSelectedType(chosen.type);
+                }
+            })
+            .catch(() => { /* loader types unavailable — form will be empty */ });
+    }, [disableConnectors, initialType]);
+
+    const selectedLoader = loaderTypes.find(l => l.type === selectedType);
+
+    const handleSelectLoader = (loader: LoaderType) => {
+        setSelectedType(loader.type);
+        createdIdRef.current = null;
+    };
+
+    // Called by DataLoaderForm before connecting — creates the connector and returns its ID
+    const handleBeforeConnect = useCallback(async (params: Record<string, any>): Promise<string> => {
+        // If already created (e.g. retry after failed connect), reuse the ID
+        if (createdIdRef.current) return createdIdRef.current;
+
+        const { data } = await apiRequest<any>(CONNECTOR_URLS.CREATE, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                loader_type: selectedType,
+                display_name: deriveConnectorDisplayName(selectedLoader?.name || selectedType, params),
+                icon: selectedType,
+                params,
+                persist: true,
+            }),
+        });
+        createdIdRef.current = data.id;
+        return data.id;
+    }, [selectedType, selectedLoader]);
+
+    // After DataLoaderForm successfully connects, fetch full connector info and notify parent
+    const handleConnected = useCallback(async () => {
+        const cid = createdIdRef.current;
+        if (!cid) return;
+        try {
+            const { data: listData } = await apiRequest<any>(CONNECTOR_URLS.LIST, { method: 'GET' });
+            const created = (listData.connectors || []).find((c: ConnectorInstance) => c.id === cid);
+            if (created) {
+                onCreated({ ...created, connected: true });
+                dispatch(dfActions.addMessages({
+                    timestamp: Date.now(), component: 'connector', type: 'success',
+                    value: t('upload.messages.connectedTo', { name: created.display_name, defaultValue: 'Connected to "{{name}}"' }),
+                }));
+            }
+        } catch {
+            // Connection succeeded even if list fetch fails
+        }
+    }, [onCreated, dispatch]);
+
+    // Left sidebar row style, mirroring the model manager's list rows.
+    const sidebarButtonSx = (typeKey: string) => ({
+        fontSize: '0.8125rem',
+        fontWeight: selectedType === typeKey ? 600 : 400,
+        textTransform: 'none' as const,
+        width: { xs: 'auto', sm: '100%' },
+        minWidth: 'max-content',
+        justifyContent: 'flex-start',
+        textAlign: 'left' as const,
+        borderRadius: 0,
+        py: 0.75,
+        px: 2.5,
+        color: selectedType === typeKey ? 'primary.main' : 'text.primary',
+        bgcolor: selectedType === typeKey ? 'action.selected' : 'transparent',
+    });
+
+    // Hosted/anonymous deployments disable connectors entirely. Replace the
+    // loader picker with an upgrade panel so visitors learn what they get
+    // by installing Data Formulator locally.
+    if (disableConnectors) {
+        return <LocalInstallUpgradePanel />;
+    }
+
+    return (
+        <Box sx={{ display: 'flex', flexDirection: { xs: 'column', sm: 'row' }, height: '100%', overflow: 'hidden' }}>
+            {/* Left sidebar: loader types */}
+            <Box sx={{
+                display: 'flex', flexDirection: { xs: 'row', sm: 'column' },
+                width: { xs: '100%', sm: 184 }, minWidth: { xs: 0, sm: 184 }, maxWidth: { xs: 'none', sm: 184 },
+                borderRight: { xs: 0, sm: `1px solid ${borderColor.divider}` },
+                borderBottom: { xs: `1px solid ${borderColor.divider}`, sm: 0 },
+                overflowY: { xs: 'hidden', sm: 'auto' }, overflowX: { xs: 'auto', sm: 'hidden' },
+                pt: { xs: 0, sm: 1 },
+                flexShrink: 0,
             }}>
-                {regularDataSources.map((source) => (
-                    <DataSourceCard
-                        key={source.value}
-                        icon={source.icon}
-                        title={source.title}
-                        description={source.description}
-                        onClick={() => onSelectTab(source.value)}
-                        disabled={source.disabled}
-                        disabledReason={source.disabledReason}
-                    />
+                <Typography variant="subtitle2" sx={{
+                    px: 2.5, py: 0.75, fontSize: '0.8125rem', fontWeight: 600,
+                    display: { xs: 'none', sm: 'block' },
+                }}>
+                    {t('upload.dataSourceTypes', { defaultValue: 'Data Sources' })}
+                </Typography>
+                {[...loaderTypes].sort((a, b) => connectorSortOrder(a.type, b.type)).map((loader) => {
+                    const isPlugin = loader.source === 'plugin';
+                    const btn = (
+                        <Button
+                            key={loader.type}
+                            variant="text" size="small" color="primary"
+                            onClick={() => handleSelectLoader(loader)}
+                            sx={sidebarButtonSx(loader.type)}
+                            startIcon={getConnectorIcon(loader.type, { sx: { fontSize: iconVar.lg } })}
+                        >
+                            <Box component="span" sx={{ flex: 1, textAlign: 'left' }}>{loader.name}</Box>
+                            {isPlugin && (
+                                <Box
+                                    component="span"
+                                    sx={{
+                                        ml: 0.5,
+                                        px: 0.5,
+                                        fontSize: '0.75rem',
+                                        color: 'text.secondary',
+                                        border: '1px solid',
+                                        borderColor: 'divider',
+                                        borderRadius: 0.5,
+                                        lineHeight: 1.4,
+                                    }}
+                                >
+                                    plugin
+                                </Box>
+                            )}
+                        </Button>
+                    );
+                    return isPlugin ? (
+                        <Tooltip
+                            key={loader.type}
+                            title={`External plugin loaded from ${loader.source_path}`}
+                            placement="right" arrow
+                        >
+                            <span>{btn}</span>
+                        </Tooltip>
+                    ) : btn;
+                })}
+                {Object.entries(disabledLoaders).sort(([a], [b]) => connectorSortOrder(a, b)).map(([name, { install_hint }]) => (
+                    <Tooltip key={name} title={install_hint} placement="right" arrow>
+                        <span style={{ width: '100%' }}>
+                            <Button
+                                variant="text" size="small" disabled
+                                sx={{
+                                    fontSize: '0.8125rem', textTransform: 'none', width: { xs: 'auto', sm: '100%' },
+                                    minWidth: 'max-content',
+                                    justifyContent: 'flex-start', textAlign: 'left',
+                                    borderRadius: 0, py: 0.75, px: 2.5,
+                                    color: 'text.disabled !important',
+                                }}
+                                startIcon={getConnectorIcon(name, { sx: { fontSize: iconVar.lg, opacity: 0.4 } })}
+                            >
+                                {name}
+                            </Button>
+                        </span>
+                    </Tooltip>
                 ))}
             </Box>
 
-            {/* Live Data Sources */}
-            <Typography 
-                variant="body2" 
-                color="text.secondary" 
-                sx={{ 
-                    textAlign: 'left',
-                    my: 1,
-                    opacity: 0.6,
-                    fontSize: '0.75rem',
-                    letterSpacing: '0.02em',
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 1,
-                }}
-            >
-                <StreamIcon sx={{ fontSize: 14, animation: 'pulse 2s infinite', '@keyframes pulse': {
-                    '0%': { opacity: 1, color: 'primary.main' },
-                    '50%': { opacity: 0.5, color: 'primary.light' },
-                    '100%': { opacity: 1, color: 'primary.main' },
-                }, }} /> Or connect to a data source (with optional auto-refresh)
-            </Typography>
-
-            <Box sx={{ 
-                display: 'grid', 
-                gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
-                gap: 1.5,
-            }}>
-                {liveDataSources.map((source) => (
-                    <DataSourceCard
-                        key={source.value}
-                        icon={source.icon}
-                        title={source.title}
-                        description={source.description}
-                        onClick={() => onSelectTab(source.value)}
-                        disabled={source.disabled}
-                        disabledReason={source.disabledReason}
+            {/* Right panel: display name + DataLoaderForm (or simplified Local Folder panel) */}
+            <Box sx={{ flex: 1, overflow: 'auto', p: 0 }}>
+                {/* Plugin rejection banner — surfaces plugins that failed to load
+                    so users notice broken extensions. Successful loads are indicated
+                    by the "plugin" tag next to the loader name in the sidebar. */}
+                {pluginsInfo && pluginsInfo.errors.length > 0 && (
+                    <Box sx={{ px: 2, pt: 1.5 }}>
+                        <Alert severity="error" variant="outlined" sx={{ mb: 1, fontSize: textVar.xs, py: 0.5 }}>
+                            <AlertTitle sx={{ fontSize: textVar.sm, fontWeight: 600, mb: 0.5 }}>
+                                {pluginsInfo.errors.length} plugin{pluginsInfo.errors.length === 1 ? '' : 's'} rejected
+                            </AlertTitle>
+                            {pluginsInfo.errors.map((e, i) => (
+                                <Box key={i} sx={{ fontSize: textVar.xs, lineHeight: 1.4 }}>
+                                    <code style={{ fontSize: textVar.xxs }}>{e.file.split('/').pop()}</code>: {e.reason}
+                                </Box>
+                            ))}
+                        </Alert>
+                    </Box>
+                )}
+                {selectedLoader && selectedType === 'local_folder' ? (
+                    /* Simplified Local Folder panel — no connection name, no form tiers */
+                    <LocalFolderPanel
+                        onConnectorCreated={(newConn) => {
+                            onCreated(newConn);
+                        }}
                     />
-                ))}
+                ) : selectedLoader ? (
+                    <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+                        {/* Connector setup timeline */}
+                        <ScrollFadeContainer sx={{ px: { xs: 2, md: 3 }, pt: 2, pb: 7 }} resetKey={selectedType}>
+                            <DataLoaderForm
+                                dataLoaderType={selectedType}
+                                paramDefs={selectedLoader.params}
+                                authInstructions={selectedLoader.auth_instructions || ''}
+                                delegatedLogin={selectedLoader.delegated_login}
+                                authMode={selectedLoader.auth_mode}
+                                authPaths={selectedLoader.auth_paths}
+                                formTitle={t('upload.createConnectionTo', {
+                                    name: selectedLoader.name,
+                                    defaultValue: 'Create a connection to {{name}}',
+                                })}
+                                onImport={() => {}}
+                                onFinish={(status, message) => {
+                                    dispatch(dfActions.addMessages({
+                                        timestamp: Date.now(), component: 'connector',
+                                        type: status === 'success' ? 'success' : 'error',
+                                        value: message,
+                                    }));
+                                }}
+                                onConnected={handleConnected}
+                                onBeforeConnect={handleBeforeConnect}
+                                onAskAgent={onAskAgent}
+                            />
+                        </ScrollFadeContainer>
+                    </Box>
+                ) : (
+                    <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'text.disabled' }}>
+                        <Typography variant="body2" sx={{ fontStyle: 'italic', fontSize: textVar.sm }}>
+                            {t('upload.selectDataSourceType', { defaultValue: 'Select a data source type' })}
+                        </Typography>
+                    </Box>
+                )}
             </Box>
         </Box>
     );
@@ -453,29 +1235,64 @@ export interface UnifiedDataUploadDialogProps {
     open: boolean;
     onClose: () => void;
     initialTab?: UploadTabType;
+    onConnectorsChanged?: () => void;
 }
 
 export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = ({
     open,
     onClose,
     initialTab = 'menu',
+    onConnectorsChanged,
 }) => {
     const theme = useTheme();
+    const { t } = useTranslation();
     const dispatch = useDispatch<AppDispatch>();
-    const existingTables = useSelector((state: DataFormulatorState) => state.tables);
+    const existingTables = useSelector(dfSelectors.getAllTables);
     const serverConfig = useSelector((state: DataFormulatorState) => state.serverConfig);
-    const dataCleanBlocks = useSelector((state: DataFormulatorState) => state.dataCleanBlocks);
+    const dataLoadingChatMessages = useSelector((state: DataFormulatorState) => state.dataLoadingChatMessages);
+    const frontendRowLimit = useSelector((state: DataFormulatorState) => state.config?.frontendRowLimit ?? 2_000_000);
+    const activeWorkspace = useSelector((state: DataFormulatorState) => state.activeWorkspace);
+    const identityKey = useSelector((state: DataFormulatorState) => `${state.identity.type}:${state.identity.id}`);
     const existingNames = new Set(existingTables.map(t => t.id));
 
-    const [activeTab, setActiveTab] = useState<UploadTabType>(initialTab === 'menu' ? 'menu' : initialTab);
+    // 'local-folder' is no longer a dedicated tab — it opens the Add Connection
+    // panel with the local_folder loader pre-selected.
+    const [activeTab, setActiveTab] = useState<UploadTabType>(
+        initialTab === 'menu' ? 'menu' : (initialTab === 'local-folder' ? 'add-connection' : initialTab)
+    );
+    const [addConnectionInitialType, setAddConnectionInitialType] = useState<string | undefined>(
+        initialTab === 'local-folder' ? 'local_folder' : undefined,
+    );
     const fileInputRef = useRef<HTMLInputElement>(null);
     const urlInputRef = useRef<HTMLInputElement>(null);
+
+    // Connector instances fetched from GET /api/connectors
+    const [connectorInstances, setConnectorInstances] = useState<ConnectorInstance[]>([]);
+    const [connectorPendingDelete, setConnectorPendingDelete] = useState<ConnectorInstance | null>(null);
+    const [connectorNameDraft, setConnectorNameDraft] = useState('');
+
+    // Fetch connector list when dialog opens
+    const refreshConnectors = useCallback(() => {
+        apiRequest<any>(CONNECTOR_URLS.LIST, { method: 'GET' })
+            .then(({ data }) => setConnectorInstances(data.connectors || []))
+            .catch(() => { /* connector list is best-effort */ });
+    }, []);
+
+    useEffect(() => {
+        if (open) {
+            setConnectorInstances([]);
+            refreshConnectors();
+        }
+    }, [open, refreshConnectors, identityKey]);
+
+    // Storage is determined by backend config — no user toggle
+    const isEphemeral = serverConfig.WORKSPACE_BACKEND === 'ephemeral';
+    const storeOnServer = true;
 
     // Paste tab state
     const [pasteContent, setPasteContent] = useState<string>("");
     const [isLargeContent, setIsLargeContent] = useState<boolean>(false);
     const [showFullContent, setShowFullContent] = useState<boolean>(false);
-    const [isOverSizeLimit, setIsOverSizeLimit] = useState<boolean>(false);
     
     // File preview state
     const [filePreviewTables, setFilePreviewTables] = useState<DictTable[] | null>(null);
@@ -483,6 +1300,7 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
     const [filePreviewError, setFilePreviewError] = useState<string | null>(null);
     const [filePreviewFiles, setFilePreviewFiles] = useState<File[]>([]);
     const [filePreviewActiveIndex, setFilePreviewActiveIndex] = useState<number>(0);
+    const [isDragOver, setIsDragOver] = useState<boolean>(false);
 
     // URL tab state (separate from file upload)
     const [tableURL, setTableURL] = useState<string>("");
@@ -494,108 +1312,73 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
     const [urlPreviewActiveIndex, setUrlPreviewActiveIndex] = useState<number>(0);
     
     // Example URLs state
-    const [exampleUrls, setExampleUrls] = useState<Array<{ label: string; url: string; refreshSeconds: number }>>([]);
+    const [exampleUrls, setExampleUrls] = useState<Array<{ label: string; url: string; refreshSeconds: number; resetUrl?: string }>>([]); 
 
-    // Sample datasets state
-    const [datasetPreviews, setDatasetPreviews] = useState<DatasetMetadata[]>([]);
+    // Loading state for table loading (file/URL/paste)
+    const [tableLoading, setTableLoading] = useState<boolean>(false);
 
     // Constants
     const MAX_DISPLAY_LINES = 20;
     const LARGE_CONTENT_THRESHOLD = 50000;
-    const MAX_CONTENT_SIZE = 2 * 1024 * 1024;
 
     // Update active tab when initialTab changes
     useEffect(() => {
         if (open) {
-            setActiveTab(initialTab === 'menu' ? 'menu' : initialTab);
+            setActiveTab(initialTab === 'menu' ? 'menu' : (initialTab === 'local-folder' ? 'add-connection' : initialTab));
+            setAddConnectionInitialType(initialTab === 'local-folder' ? 'local_folder' : undefined);
         }
     }, [initialTab, open]);
 
-
-    // Load sample datasets
+    // When entering a connector tab, seed Redux's connect-params for that
+    // connector from its saved `pinned_params` so the form shows the
+    // existing connection details (host/db/etc) instead of an empty form.
+    // Sensitive fields (password, tokens) are never returned by the backend
+    // so they stay empty for re-entry.
     useEffect(() => {
-        if (open && activeTab === 'explore') {
-            fetch(`${getUrls().EXAMPLE_DATASETS}`)
-            .then((response) => response.json())
-            .then((result) => {
-                let datasets: DatasetMetadata[] = result.map((info: any) => {
-                    let tables = info["tables"].map((table: any) => {
-                        if (table["format"] == "json") {
-                            return {
-                                table_name: table["name"],
-                                url: table["url"],
-                                format: table["format"],
-                                sample: table["sample"],
-                            }
-                        }
-                        else if (table["format"] == "csv" || table["format"] == "tsv") {
-                            const delimiter = table["format"] === "csv" ? "," : "\t";
-                            const rows = table["sample"]
-                                .split("\n")
-                                .map((row: string) => row.split(delimiter));
-                            
-                            if (rows.length > 0) {
-                                const headers = rows[0];
-                                const dataRows = rows.slice(1);
-                                const sampleData = dataRows.map((row: string[]) => {
-                                    const obj: any = {};
-                                    headers.forEach((header: string, index: number) => {
-                                        obj[header] = row[index] || '';
-                                    });
-                                    return obj;
-                                });
-                                
-                                return {
-                                    table_name: table["name"],
-                                    url: table["url"],
-                                    format: table["format"],
-                                    sample: sampleData,
-                                };
-                            }
-                            
-                            return {
-                                table_name: table["name"],
-                                url: table["url"],
-                                format: table["format"],
-                                sample: [],
-                            };
-                        }
-                    })
-                    return { 
-                        tables: tables, 
-                        name: info["name"], 
-                        source: info["source"],
-                        live: info["live"],
-                        refreshIntervalSeconds: info["refreshIntervalSeconds"]
-                    }
-                }).filter((t: DatasetMetadata | undefined) => t != undefined);
-                setDatasetPreviews(datasets);
-            });
-        } else if (open && activeTab === 'url') {
-            fetch(`${window.location.origin}/api/demo-stream/info`)
-            .then(res => res.json())
-            .then(data => {
-                const demoExamples = data.demo_examples
+        if (!open || !activeTab.startsWith('connector:')) return;
+        const connId = activeTab.slice('connector:'.length);
+        const conn = connectorInstances.find(c => c.id === connId);
+        if (!conn) return;
+        if (Object.keys(conn.pinned_params || {}).length === 0) return;
+        dispatch(dfActions.updateDataLoaderConnectParams({
+            dataLoaderType: connId,
+            params: { ...conn.pinned_params },
+        }));
+        // We deliberately seed only on tab entry — subsequent edits stay in
+        // Redux as the user types.
+         
+    }, [open, activeTab, connectorInstances]);
+
+
+    // Load example URLs for the URL tab. The demo-stream/info endpoint
+    // returns plain JSON (no {status:'success', data:...} envelope), so we
+    // bypass apiRequest's envelope check and call fetch directly.
+    useEffect(() => {
+        if (!(open && activeTab === 'url')) return;
+        let cancelled = false;
+        fetch(`${window.location.origin}/api/demo-stream/info`)
+            .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
+            .then((data) => {
+                if (cancelled) return;
+                const demoExamples = (data.demo_examples || [])
                     .map((ex: any) => ({
                         label: ex.name,
                         url: ex.url,
-                        refreshSeconds: ex.refresh_seconds || 60
-                }));
-                
+                        refreshSeconds: ex.refresh_seconds || 60,
+                        resetUrl: ex.reset_url || undefined,
+                    }));
                 setExampleUrls(demoExamples);
             })
             .catch((err) => {
-                console.error('Failed to load examples:', err);
-            })
-            .finally(() => { });
-        }
+                if (!cancelled) console.error('Failed to load demo examples:', err);
+            });
+        return () => { cancelled = true; };
     }, [open, activeTab]);
 
     const handleClose = useCallback(() => {
         // Reset state when closing
         setPasteContent("");
         setIsLargeContent(false);
-        setIsOverSizeLimit(false);
         setShowFullContent(false);
         setFilePreviewTables(null);
         setFilePreviewLoading(false);
@@ -613,84 +1396,143 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
         onClose();
     }, [onClose]);
 
-    // File upload handler
-    const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>): void => {
-        const files = event.target.files;
+    // Connector setup escape hatch: queue the seeded question and switch to the
+    // data-loading chat, where the agent can inspect config and finish setup.
+    const handleAskAgent = useCallback((prompt: string) => {
+        dispatch(dfActions.queueDataLoadingTask({ text: prompt, images: [], attachments: [] }));
+        setActiveTab('extract');
+    }, [dispatch]);
 
-        if (files && files.length > 0) {
-            const selectedFiles = Array.from(files);
-            setFilePreviewFiles(selectedFiles);
-            setFilePreviewError(null);
-            setFilePreviewTables(null);
-            setFilePreviewLoading(true);
+    // Shared file processing logic (used by both file input and drag-and-drop)
+    const processUploadedFiles = useCallback((selectedFiles: File[]): void => {
+        setFilePreviewFiles(selectedFiles);
+        setFilePreviewError(null);
+        setFilePreviewTables(null);
+        setFilePreviewLoading(true);
 
-            const MAX_FILE_SIZE = 5 * 1024 * 1024;
-            const previewTables: DictTable[] = [];
-            const errors: string[] = [];
+        const previewTables: DictTable[] = [];
+        const errors: string[] = [];
 
-            const processFiles = async () => {
-                for (const file of selectedFiles) {
-                    const uniqueName = getUniqueTableName(file.name, existingNames);
-                    const isTextFile = file.type === 'text/csv' || 
-                        file.type === 'text/tab-separated-values' || 
-                        file.type === 'application/json' ||
-                        file.name.endsWith('.csv') || 
-                        file.name.endsWith('.tsv') || 
-                        file.name.endsWith('.json');
-                    const isExcelFile = file.type === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
-                        file.type === 'application/vnd.ms-excel' ||
-                        file.name.endsWith('.xlsx') || 
-                        file.name.endsWith('.xls');
+        const processFiles = async () => {
+            for (const file of selectedFiles) {
+                const uniqueName = getUniqueTableName(file.name, existingNames);
+                const isTextFile = file.type === 'text/csv' || 
+                    file.type === 'text/tab-separated-values' || 
+                    file.type === 'application/json' ||
+                    file.name.endsWith('.csv') || 
+                    file.name.endsWith('.tsv') || 
+                    file.name.endsWith('.json');
+                const isExcelFile = file.type === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
+                    file.type === 'application/vnd.ms-excel' ||
+                    file.name.endsWith('.xlsx') || 
+                    file.name.endsWith('.xls');
 
-                    if (file.size > MAX_FILE_SIZE && isTextFile) {
-                        errors.push(`File ${file.name} is too large (${(file.size / (1024 * 1024)).toFixed(2)}MB). Use Database for large files.`);
-                        continue;
+                if (isTextFile) {
+                    try {
+                        const text = await readFileText(file);
+                        const table = loadTextDataWrapper(uniqueName, text, file.type);
+                        if (table) {
+                            previewTables.push(table);
+                        } else {
+                            errors.push(t('upload.errors.failedToParse', { name: file.name }));
+                        }
+                    } catch {
+                        errors.push(t('upload.errors.failedToRead', { name: file.name }));
                     }
+                    continue;
+                }
 
-                    if (isTextFile) {
+                if (isExcelFile) {
+                    const isLegacyXls = file.name.toLowerCase().endsWith('.xls') && !file.name.toLowerCase().endsWith('.xlsx');
+                    if (isLegacyXls) {
                         try {
-                            const text = await file.text();
-                            const table = loadTextDataWrapper(uniqueName, text, file.type);
-                            if (table) {
-                                previewTables.push(table);
+                            const formData = new FormData();
+                            formData.append('file', file);
+                            const { data: result } = await apiRequest<any>(getUrls().PARSE_FILE, {
+                                method: 'POST',
+                                body: formData,
+                            });
+                            if (result.sheets?.length > 0) {
+                                for (const sheet of result.sheets) {
+                                    const sheetTitle = result.sheets.length > 1
+                                        ? `${uniqueName}-${sheet.sheet_name}`
+                                        : uniqueName;
+                                    const table = createTableFromFromObjectArray(sheetTitle, sheet.data);
+                                    previewTables.push(table);
+                                }
                             } else {
-                                errors.push(`Failed to parse ${file.name}.`);
+                                errors.push(t('upload.errors.failedToParseExcel', { name: file.name }));
                             }
                         } catch {
-                            errors.push(`Failed to read ${file.name}.`);
+                            errors.push(t('upload.errors.failedToParseExcel', { name: file.name }));
                         }
-                        continue;
-                    }
-
-                    if (isExcelFile) {
+                    } else {
                         try {
                             const arrayBuffer = await file.arrayBuffer();
                             const tables = await loadBinaryDataWrapper(uniqueName, arrayBuffer);
                             if (tables.length > 0) {
                                 previewTables.push(...tables);
                             } else {
-                                errors.push(`Failed to parse Excel file ${file.name}.`);
+                                errors.push(t('upload.errors.failedToParseExcel', { name: file.name }));
                             }
                         } catch {
-                            errors.push(`Failed to parse Excel file ${file.name}.`);
+                            errors.push(t('upload.errors.failedToParseExcel', { name: file.name }));
                         }
-                        continue;
                     }
-
-                    errors.push(`Unsupported file format: ${file.name}.`);
+                    continue;
                 }
 
-                setFilePreviewTables(previewTables.length > 0 ? previewTables : null);
-                setFilePreviewError(errors.length > 0 ? errors.join(' ') : null);
-                setFilePreviewLoading(false);
-            };
+                errors.push(t('upload.errors.unsupportedFormat', { name: file.name }));
+            }
 
-            processFiles();
+            setFilePreviewTables(previewTables.length > 0 ? previewTables : null);
+            setFilePreviewError(errors.length > 0 ? errors.join(' ') : null);
+            setFilePreviewLoading(false);
+        };
+
+        processFiles();
+     
+    }, [existingNames, t]);
+
+    // File input change handler
+    const handleFileInputChange = (event: React.ChangeEvent<HTMLInputElement>): void => {
+        const files = event.target.files;
+        if (files && files.length > 0) {
+            processUploadedFiles(Array.from(files));
         }
         if (fileInputRef.current) {
             fileInputRef.current.value = '';
         }
     };
+
+    // Drag-and-drop handlers
+    const handleDragOver = useCallback((event: React.DragEvent): void => {
+        event.preventDefault();
+        event.stopPropagation();
+    }, []);
+
+    const handleDragEnter = useCallback((event: React.DragEvent): void => {
+        event.preventDefault();
+        event.stopPropagation();
+        setIsDragOver(true);
+    }, []);
+
+    const handleDragLeave = useCallback((event: React.DragEvent): void => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.currentTarget.contains(event.relatedTarget as Node)) return;
+        setIsDragOver(false);
+    }, []);
+
+    const handleFileDrop = useCallback((event: React.DragEvent): void => {
+        event.preventDefault();
+        event.stopPropagation();
+        setIsDragOver(false);
+        const files = event.dataTransfer.files;
+        if (files && files.length > 0) {
+            processUploadedFiles(Array.from(files));
+        }
+    }, [processUploadedFiles]);
 
     // Reset activeIndex when tables change
     useEffect(() => {
@@ -703,7 +1545,7 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
         }
     }, [filePreviewTables, filePreviewActiveIndex]);
 
-    const handleFileLoadSingleTable = (): void => {
+    const handleFileLoadSingleTable = async (): Promise<void> => {
         if (!filePreviewTables || filePreviewTables.length === 0) {
             return;
         }
@@ -711,22 +1553,60 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
         if (table) {
             const sourceConfig: DataSourceConfig = { type: 'file', fileName: filePreviewFiles[0]?.name };
             const tableWithSource = { ...table, source: sourceConfig };
-            dispatch(dfActions.loadTable(tableWithSource));
-            dispatch(fetchFieldSemanticType(tableWithSource));
+            setTableLoading(true);
+            try {
+                await dispatch(loadTable({
+                    table: tableWithSource,
+                    file: storeOnServer ? filePreviewFiles[filePreviewActiveIndex] || filePreviewFiles[0] : undefined,
+                }));
+            } finally {
+                setTableLoading(false);
+            }
             handleClose();
         }
     };
 
-    const handleFileLoadAllTables = (): void => {
+    const handleFileLoadAllTables = async (): Promise<void> => {
         if (!filePreviewTables || filePreviewTables.length === 0) {
             return;
         }
-        for (let i = 0; i < filePreviewTables.length; i++) {
-            const table = filePreviewTables[i];
-            const sourceConfig: DataSourceConfig = { type: 'file', fileName: filePreviewFiles[i]?.name || filePreviewFiles[0]?.name };
-            const tableWithSource = { ...table, source: sourceConfig };
-            dispatch(dfActions.loadTable(tableWithSource));
-            dispatch(fetchFieldSemanticType(tableWithSource));
+
+        setTableLoading(true);
+        try {
+            // When storing on server, remove frontend-only orphans from the same
+            // source files (sheets that existed before but are absent in the new batch).
+            const seenSourceFiles = new Set<string>();
+            if (storeOnServer) {
+                const newTableIds = new Set(filePreviewTables.map(t => t.id));
+                const sourceFileNames = new Set<string>();
+                for (let i = 0; i < filePreviewTables.length; i++) {
+                    const fn = filePreviewFiles[i]?.name || filePreviewFiles[0]?.name;
+                    if (fn) sourceFileNames.add(fn);
+                }
+                for (const t of existingTables) {
+                    if (t.source?.type === 'file' && t.source.fileName && sourceFileNames.has(t.source.fileName) && !newTableIds.has(t.id)) {
+                        dispatch(dfActions.removeTableLocally(t.id));
+                    }
+                }
+            }
+
+            for (let i = 0; i < filePreviewTables.length; i++) {
+                const table = filePreviewTables[i];
+                const fileName = filePreviewFiles[i]?.name || filePreviewFiles[0]?.name;
+                const sourceConfig: DataSourceConfig = { type: 'file', fileName };
+                const tableWithSource = { ...table, source: sourceConfig };
+
+                const isFirstForFile = fileName ? !seenSourceFiles.has(fileName) : false;
+                if (fileName) seenSourceFiles.add(fileName);
+
+                await dispatch(loadTable({
+                    table: tableWithSource,
+                    file: storeOnServer ? filePreviewFiles[i] || filePreviewFiles[0] : undefined,
+                    replaceSource: storeOnServer && isFirstForFile,
+                }));
+            }
+        } finally {
+            setTableLoading(false);
         }
         handleClose();
     };
@@ -744,10 +1624,6 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
         const newContent = event.target.value;
         setPasteContent(newContent);
         
-        const contentSizeBytes = new Blob([newContent]).size;
-        const isOverLimit = contentSizeBytes > MAX_CONTENT_SIZE;
-        setIsOverSizeLimit(isOverLimit);
-        
         const isLarge = newContent.length > LARGE_CONTENT_THRESHOLD;
         setIsLargeContent(isLarge);
         
@@ -761,7 +1637,7 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
         setShowFullContent(!showFullContent);
     }, [showFullContent]);
 
-    const handlePasteSubmit = (): void => {
+    const handlePasteSubmit = async (): Promise<void> => {
         let table: undefined | DictTable = undefined;
         
         const defaultName = (() => {
@@ -777,15 +1653,19 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
 
         try {
             let content = JSON.parse(pasteContent);
-            table = createTableFromFromObjectArray(uniqueName, content, true);
+            table = createTableFromFromObjectArray(uniqueName, content);
         } catch (error) {
             table = createTableFromText(uniqueName, pasteContent);
         }
         if (table) {
             // Add source info for paste data
             const tableWithSource = { ...table, source: { type: 'paste' as const } };
-            dispatch(dfActions.loadTable(tableWithSource));
-            dispatch(fetchFieldSemanticType(tableWithSource));
+            setTableLoading(true);
+            try {
+                await dispatch(loadTable({ table: tableWithSource }));
+            } finally {
+                setTableLoading(false);
+            }
             handleClose();
         }
     };
@@ -825,7 +1705,7 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                     if (!Array.isArray(jsonContent)) {
                         throw new Error('JSON content must be an array of objects.');
                     }
-                    table = createTableFromFromObjectArray(tableName, jsonContent, true);
+                    table = createTableFromFromObjectArray(tableName, jsonContent);
                 } catch (jsonError) {
                     // If JSON parsing fails, try JSONL (JSON Lines) format
                     try {
@@ -838,7 +1718,7 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                             }
                         });
                         if (jsonlObjects.length > 0 && typeof jsonlObjects[0] === 'object' && jsonlObjects[0] !== null) {
-                            table = createTableFromFromObjectArray(tableName, jsonlObjects, true);
+                            table = createTableFromFromObjectArray(tableName, jsonlObjects);
                         } else {
                             throw new Error('JSONL must contain objects.');
                         }
@@ -851,11 +1731,11 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                 if (table) {
                     setUrlPreviewTables([table]);
                 } else {
-                    setUrlPreviewError('Unable to parse data from the provided URL. Please ensure the URL points to CSV, JSON, or JSONL data.');
+                    setUrlPreviewError(t('upload.errors.unableToParseUrl'));
                 }
             })
             .catch((err) => {
-                setUrlPreviewError(`Failed to fetch data: ${err.message}. Please ensure the URL points to CSV, JSON, or JSONL data.`);
+                setUrlPreviewError(t('upload.errors.failedToFetch', { message: err.message }));
             })
             .finally(() => {
                 setUrlPreviewLoading(false);
@@ -864,7 +1744,7 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
 
 
     // URL tab load handlers
-    const handleURLLoadSingleTable = (): void => {
+    const handleURLLoadSingleTable = async (): Promise<void> => {
         if (!urlPreviewTables || urlPreviewTables.length === 0) {
             return;
         }
@@ -883,33 +1763,41 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                 sourceConfig = { type: 'url', url: tableURL };
             }
             const tableWithSource = { ...table, source: sourceConfig };
-            dispatch(dfActions.loadTable(tableWithSource));
-            dispatch(fetchFieldSemanticType(tableWithSource));
+            setTableLoading(true);
+            try {
+                await dispatch(loadTable({ table: tableWithSource }));
+            } finally {
+                setTableLoading(false);
+            }
             handleClose();
         }
     };
 
-    const handleURLLoadAllTables = (): void => {
+    const handleURLLoadAllTables = async (): Promise<void> => {
         if (!urlPreviewTables || urlPreviewTables.length === 0) {
             return;
         }
-        for (let i = 0; i < urlPreviewTables.length; i++) {
-            const table = urlPreviewTables[i];
-            let sourceConfig: DataSourceConfig;
-            if (urlAutoRefresh) {
-                sourceConfig = { 
-                    type: 'stream', 
-                    url: tableURL,
-                    autoRefresh: true,
-                    refreshIntervalSeconds: urlRefreshInterval,
-                    lastRefreshed: Date.now()
-                };
-            } else {
-                sourceConfig = { type: 'url', url: tableURL };
+        setTableLoading(true);
+        try {
+            for (let i = 0; i < urlPreviewTables.length; i++) {
+                const table = urlPreviewTables[i];
+                let sourceConfig: DataSourceConfig;
+                if (urlAutoRefresh) {
+                    sourceConfig = { 
+                        type: 'stream', 
+                        url: tableURL,
+                        autoRefresh: true,
+                        refreshIntervalSeconds: urlRefreshInterval,
+                        lastRefreshed: Date.now()
+                    };
+                } else {
+                    sourceConfig = { type: 'url', url: tableURL };
+                }
+                const tableWithSource = { ...table, source: sourceConfig };
+                await dispatch(loadTable({ table: tableWithSource }));
             }
-            const tableWithSource = { ...table, source: sourceConfig };
-            dispatch(dfActions.loadTable(tableWithSource));
-            dispatch(fetchFieldSemanticType(tableWithSource));
+        } finally {
+            setTableLoading(false);
         }
         handleClose();
     };
@@ -930,20 +1818,87 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
     const hasMultipleUrlTables = (urlPreviewTables?.length || 0) > 1;
     const showFilePreview = filePreviewLoading || !!filePreviewError || (filePreviewTables && filePreviewTables.length > 0);
     const showUrlPreview = urlPreviewLoading || !!urlPreviewError || (urlPreviewTables && urlPreviewTables.length > 0);
+    const showExamples = exampleUrls.length > 0
+        && (!urlPreviewTables || urlPreviewTables.length === 0)
+        && !urlPreviewLoading;
     const hasPasteContent = (pasteContent || '').trim() !== '';
 
     // Get current tab title for header
     const getCurrentTabTitle = () => {
-        const tabTitles: Record<UploadTabType, string> = {
-            'menu': 'Load Data',
-            'explore': 'Sample Datasets',
-            'upload': 'Upload File',
-            'paste': 'Paste Data',
-            'extract': 'Extract from Documents',
-            'url': 'Load from URL',
-            'database': 'Database',
+        if (activeTab.startsWith('connector:')) {
+            const connId = activeTab.slice(10);
+            const found = connectorInstances.find(c => c.id === connId);
+            return found?.display_name || connId;
+        }
+        if (activeTab === 'add-connection') {
+            return t('upload.addConnection', { defaultValue: 'Connect databases' });
+        }
+        const tabTitles: Record<string, string> = {
+            'menu': t('upload.title'),
+            'upload': t('upload.uploadFile'),
+            'paste': t('upload.pasteData'),
+            'extract': t('upload.dataAssistant'),
+            'url': t('upload.loadFromUrl'),
+            'database': t('upload.database'),
         };
-        return tabTitles[activeTab] || 'Add Data';
+        return tabTitles[activeTab] || t('upload.addData');
+    };
+
+    const activeConnector = activeTab.startsWith('connector:')
+        ? connectorInstances.find(c => c.id === activeTab.slice('connector:'.length))
+        : undefined;
+
+    useEffect(() => {
+        setConnectorNameDraft(activeConnector?.display_name || '');
+    }, [activeConnector?.id, activeConnector?.display_name]);
+
+    const commitConnectorName = async () => {
+        if (!activeConnector) return;
+        const displayName = connectorNameDraft.trim();
+        if (!displayName) {
+            setConnectorNameDraft(activeConnector.display_name);
+            return;
+        }
+        if (displayName === activeConnector.display_name) return;
+
+        try {
+            await apiRequest(CONNECTOR_URLS.UPDATE(activeConnector.id), {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ display_name: displayName }),
+            });
+            setConnectorInstances(prev => prev.map(connector => (
+                connector.id === activeConnector.id
+                    ? { ...connector, display_name: displayName }
+                    : connector
+            )));
+            onConnectorsChanged?.();
+        } catch (err: any) {
+            setConnectorNameDraft(activeConnector.display_name);
+            dispatch(dfActions.addMessages({
+                timestamp: Date.now(), component: 'connector', type: 'error',
+                value: err.message || t('upload.errors.failedToRenameConnector', { defaultValue: 'Failed to rename connector' }),
+            }));
+        }
+    };
+
+    const deleteConnector = async (connector: ConnectorInstance) => {
+        try {
+            await apiRequest(CONNECTOR_URLS.DELETE(connector.id), { method: 'DELETE' });
+            setConnectorInstances(prev => prev.filter(c => c.id !== connector.id));
+            setConnectorPendingDelete(null);
+            setActiveTab('menu');
+            onConnectorsChanged?.();
+            dispatch(dfActions.addMessages({
+                timestamp: Date.now(), component: 'connector', type: 'success',
+                value: t('upload.messages.deletedConnector', { name: connector.display_name, defaultValue: 'Deleted connector "{{name}}"' }),
+            }));
+        } catch (err: any) {
+            dispatch(dfActions.addMessages({
+                timestamp: Date.now(), component: 'connector', type: 'error',
+                value: err.message || t('upload.errors.failedToDeleteConnector', { defaultValue: 'Failed to delete connector' }),
+            }));
+        }
     };
 
     return (
@@ -953,10 +1908,19 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
             maxWidth={false}
             sx={{ 
                 '& .MuiDialog-paper': { 
-                    width: 1100,
-                    maxWidth: '95vw',
-                    height: 600, 
-                    maxHeight: '90vh',
+                    // Working surface, not a prompt: claim almost the whole
+                    // viewport on small screens (a percentage cap would waste
+                    // 5-10% there) and stop growing at a comfortable size on
+                    // large ones.
+                    m: 2,
+                    width: activeTab === 'add-connection'
+                        ? dialogWidth(1120)
+                        : dialogWidth(1280),
+                    maxWidth: 'none',
+                    height: activeTab === 'add-connection'
+                        ? dialogHeight(680)
+                        : dialogHeight(860),
+                    maxHeight: 'none',
                     display: 'flex',
                     flexDirection: 'column',
                     transition: 'width 0.2s ease',
@@ -964,7 +1928,7 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
             }}
         >
             <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1, pb: 1 }}>
-                {activeTab !== 'menu' && (
+                {activeTab !== 'menu' && !(activeTab === 'add-connection' && serverConfig.DISABLE_DATA_CONNECTORS) && (
                     <IconButton
                         size="small"
                         onClick={() => setActiveTab('menu')}
@@ -973,11 +1937,57 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                         <ArrowBackIcon fontSize="small" />
                     </IconButton>
                 )}
-                <Typography variant="h6" component="span">
-                    {activeTab === 'menu' ? 'Load Data' : getCurrentTabTitle()}
-                </Typography>
-                {activeTab === 'extract' && dataCleanBlocks.length > 0 && (
-                    <Tooltip title="Reset extraction">
+                {activeConnector ? (
+                    <Box sx={{ minWidth: 0, display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                        <TextField
+                            value={connectorNameDraft}
+                            onChange={(event) => setConnectorNameDraft(event.target.value)}
+                            onBlur={() => void commitConnectorName()}
+                            onKeyDown={(event) => {
+                                if (event.key === 'Enter') event.currentTarget.querySelector('input')?.blur();
+                                if (event.key === 'Escape') {
+                                    setConnectorNameDraft(activeConnector.display_name);
+                                    event.currentTarget.querySelector('input')?.blur();
+                                }
+                            }}
+                            variant="standard"
+                            inputProps={{ 'aria-label': t('upload.connectionName', { defaultValue: 'Connector name' }) }}
+                            sx={{
+                                width: `clamp(120px, ${Math.max(connectorNameDraft.length + 1, 8)}ch, 360px)`,
+                                '& .MuiInputBase-input': {
+                                    py: 0,
+                                    fontSize: 20,
+                                    lineHeight: 1.35,
+                                    fontWeight: 500,
+                                    letterSpacing: 0,
+                                },
+                                '& .MuiInput-underline:before': { borderBottomColor: 'transparent' },
+                                '& .MuiInput-underline:hover:not(.Mui-disabled):before': { borderBottomColor: 'divider' },
+                            }}
+                        />
+                        <Typography sx={{ flexShrink: 0, fontSize: textVar.md, color: 'secondary.main', fontWeight: 600 }}>
+                            ({activeConnector.icon.replaceAll('_', ' ').toUpperCase()})
+                        </Typography>
+                    </Box>
+                ) : (
+                    <Typography variant="h6" component="span">
+                        {activeTab === 'menu' ? t('upload.title') : getCurrentTabTitle()}
+                    </Typography>
+                )}
+                {activeConnector?.deletable && (
+                    <Tooltip title={t('sidebar.deleteConnector', { defaultValue: 'Delete connector' })}>
+                        <IconButton
+                            size="small"
+                            color="error"
+                            aria-label={t('sidebar.deleteConnector', { defaultValue: 'Delete connector' })}
+                            onClick={() => setConnectorPendingDelete(activeConnector)}
+                        >
+                            <DeleteOutlineIcon sx={{ fontSize: iconVar.lg }} />
+                        </IconButton>
+                    </Tooltip>
+                )}
+                {activeTab === 'extract' && dataLoadingChatMessages.length > 0 && (
+                    <Tooltip title={t('upload.resetExtraction')}>
                         <IconButton 
                             size="small" 
                             color='warning' 
@@ -987,14 +1997,38 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                                     transition: 'transform 0.4s cubic-bezier(0.4, 0, 0.2, 1)' 
                                 } 
                             }} 
-                            onClick={() => dispatch(dfActions.resetDataCleanBlocks())}
+                            onClick={() => dispatch(dfActions.clearChatMessages())}
                         >
                             <RestartAltIcon fontSize="small" />
                         </IconButton>
                     </Tooltip>
                 )}
+                {activeTab !== 'menu' && (
+                    <Tooltip title={
+                        isEphemeral
+                            ? t('upload.storedTemporarily', 'Data is stored temporarily on this server')
+                            : serverConfig.WORKSPACE_BACKEND === 'azure_blob'
+                                ? t('upload.storedInAzure', 'Data is stored in Azure Blob Storage')
+                                : t('upload.storedOnDisk', `Data is stored on disk (${serverConfig.DATA_FORMULATOR_HOME || '~/.data_formulator'})`)
+                    } placement="bottom">
+                        <Box sx={{ ml: 'auto', mr: 0, display: 'flex', alignItems: 'center', gap: 0.5, px: 1 }}>
+                            {isEphemeral
+                                ? <FolderOpenIcon sx={{ fontSize: iconVar.sm, color: 'text.secondary' }} />
+                                : serverConfig.WORKSPACE_BACKEND === 'azure_blob'
+                                    ? <CloudIcon sx={{ fontSize: iconVar.sm, color: 'text.secondary' }} />
+                                    : <FolderOpenIcon sx={{ fontSize: iconVar.sm, color: 'text.secondary' }} />}
+                            <Typography variant="caption" sx={{ fontSize: '0.7rem', color: 'text.secondary' }}>
+                                {isEphemeral
+                                    ? t('upload.temporaryServerLabel', 'Temporary server')
+                                    : serverConfig.WORKSPACE_BACKEND === 'azure_blob'
+                                        ? t('upload.azureLabel', 'Azure')
+                                        : t('upload.diskLabel', 'Disk')}
+                            </Typography>
+                        </Box>
+                    </Tooltip>
+                )}
                 <IconButton
-                    sx={{ marginLeft: 'auto' }}
+                    sx={{ marginLeft: activeTab === 'menu' ? 'auto' : undefined }}
                     size="small"
                     onClick={handleClose}
                     aria-label="close"
@@ -1007,11 +2041,48 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                 {/* Main Menu */}
                 <TabPanel value={activeTab} index="menu">
                     <Box sx={{ p: 2, boxSizing: 'border-box', width: '100%', height: '100%', display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+                        <Box sx={{ width: '100%', maxWidth: 860 }}>
                         <DataLoadMenu 
                             onSelectTab={(tab) => setActiveTab(tab)}
+                            onSelectConnector={(conn) => {
+                                // Already-authed connector → close dialog and
+                                // hand off to the data-source sidebar. Otherwise
+                                // fall through to the in-dialog auth/connect form.
+                                if (conn.connected || conn.sso_auto_connect) {
+                                    handleClose();
+                                    dispatch(dfActions.focusConnector(conn.id));
+                                } else {
+                                    setActiveTab(`connector:${conn.id}` as UploadTabType);
+                                }
+                            }}
+                            onStartChat={(prompt, images, attachments) => {
+                                const hasText = prompt.trim().length > 0;
+                                const hasImages = images.length > 0;
+                                const hasAttachments = attachments.length > 0;
+                                // Always surface the chat. Preserve any prior
+                                // conversation (Option A): `queueDataLoadingTask`
+                                // drops a "new request" divider when a thread
+                                // already exists, then enqueues the submission
+                                // as a redux `pending` slot — `DataLoadingChat`
+                                // consumes it on render and auto-sends. The
+                                // header reset button starts a blank slate.
+                                if (hasText || hasImages || hasAttachments) {
+                                    dispatch(dfActions.queueDataLoadingTask({
+                                        text: prompt, images, attachments,
+                                    }));
+                                }
+                                setActiveTab('extract');
+                            }}
+                            hasPriorConversation={dataLoadingChatMessages.length > 0}
+                            onResumeChat={() => {
+                                // Reopen the existing thread without
+                                // clearing messages or auto-sending.
+                                setActiveTab('extract');
+                            }}
                             serverConfig={serverConfig}
-                            variant="dialog"
+                            connectors={connectorInstances}
                         />
+                        </Box>
                     </Box>
                 </TabPanel>
 
@@ -1028,58 +2099,54 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                     }}>
                         <Box sx={{ width: '100%', maxWidth: showFilePreview ? '60%' : 760, alignSelf: 'center', display: 'flex', flexDirection: 'column', gap: 2 }}>
                         <Input
-                            inputProps={{ 
-                                accept: '.csv,.tsv,.json,.xlsx,.xls',
-                                multiple: true,
+                            slotProps={{
+                                input: {
+                                    accept: '.csv,.tsv,.json,.xlsx,.xls',
+                                    multiple: true,
+                                },
                             }}
                             id="unified-upload-data-file"
                             type="file"
                             sx={{ display: 'none' }}
                             inputRef={fileInputRef}
-                            onChange={handleFileUpload}
+                            onChange={handleFileInputChange}
                         />
                         
-                        {/* File Upload Section - only show drop zone when file upload is enabled */}
-                        {!serverConfig.DISABLE_FILE_UPLOAD ? (
-                            <Box
-                                sx={{
-                                    border: '2px dashed',
-                                    borderColor: 'divider',
-                                    borderRadius: 2,
-                                    p: showFilePreview ? 2 : 3,
-                                    textAlign: 'center',
-                                    cursor: 'pointer',
-                                    transition: 'all 0.2s',
-                                    '&:hover': {
-                                        borderColor: 'primary.main',
-                                        backgroundColor: alpha(theme.palette.primary.main, 0.04),
-                                    }
-                                }}
-                                onClick={() => fileInputRef.current?.click()}
-                            >
-                                <UploadFileIcon sx={{ fontSize: showFilePreview ? 28 : 36, color: 'text.secondary', mb: 1 }} />
-                                <Typography variant={showFilePreview ? "body2" : "subtitle1"} gutterBottom>
-                                    Drag & drop file here
+                        {/* File Upload Section */}
+                        <Box
+                            sx={{
+                                border: '2px dashed',
+                                borderColor: isDragOver ? 'primary.main' : borderColor.divider,
+                                borderRadius: radius.md,
+                                p: showFilePreview ? 2 : 3,
+                                textAlign: 'center',
+                                cursor: 'pointer',
+                                transition: transition.normal,
+                                backgroundColor: isDragOver ? alpha(theme.palette.primary.main, 0.08) : 'transparent',
+                                '&:hover': {
+                                    borderColor: 'primary.main',
+                                    backgroundColor: alpha(theme.palette.primary.main, 0.04),
+                                }
+                            }}
+                            onClick={() => fileInputRef.current?.click()}
+                            onDrop={handleFileDrop}
+                            onDragOver={handleDragOver}
+                            onDragEnter={handleDragEnter}
+                            onDragLeave={handleDragLeave}
+                        >
+                            <UploadFileIcon sx={{ fontSize: showFilePreview ? 28 : 36, color: 'text.secondary', mb: 1 }} />
+                            <Typography variant={showFilePreview ? "body2" : "subtitle1"} gutterBottom>
+                                {t('upload.dragDrop')}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary" sx={{ fontSize: showFilePreview ? '0.75rem' : '0.875rem' }}>
+                                {t('upload.or')} <Link component="button" sx={{ textDecoration: 'underline', cursor: 'pointer' }}>{t('upload.browse')}</Link>
+                            </Typography>
+                            {!showFilePreview && (
+                                <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+                                    {t('upload.supportedFormats')}
                                 </Typography>
-                                <Typography variant="body2" color="text.secondary" sx={{ fontSize: showFilePreview ? '0.75rem' : '0.875rem' }}>
-                                    or <Link component="button" sx={{ textDecoration: 'underline', cursor: 'pointer' }}>Browse</Link>
-                                </Typography>
-                                {!showFilePreview && (
-                                    <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
-                                        Supported: CSV, TSV, JSON, Excel (xlsx, xls)
-                                    </Typography>
-                                )}
-                            </Box>
-                        ) : (
-                            <Box sx={{ textAlign: 'center', py: 4, px: 2 }}>
-                                <Typography color="text.secondary" sx={{ mb: 2 }}>
-                                    File upload is disabled in this environment.
-                                </Typography>
-                                <Typography variant="body2" color="text.secondary">
-                                    Use "Load from URL" to load data from a remote source.
-                                </Typography>
-                            </Box>
-                        )}
+                            )}
+                        </Box>
                         </Box>
 
                         {showFilePreview && (
@@ -1088,7 +2155,7 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                                     loading={filePreviewLoading}
                                     error={filePreviewError}
                                     tables={filePreviewTables}
-                                    emptyLabel="Select a file to preview."
+                                    emptyLabel={t('upload.selectFileToPreview')}
                                     onRemoveTable={handleRemoveFilePreviewTable}
                                     activeIndex={filePreviewActiveIndex}
                                     onActiveIndexChange={setFilePreviewActiveIndex}
@@ -1101,19 +2168,21 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                                 <Button
                                     variant="outlined"
                                     onClick={handleFileLoadSingleTable}
-                                    disabled={filePreviewLoading}
+                                    disabled={filePreviewLoading || tableLoading}
+                                    startIcon={tableLoading ? <CircularProgress size={16} /> : undefined}
                                     sx={{ textTransform: 'none', width: 240 }}
                                 >
-                                    Load Table
+                                    {tableLoading ? t('upload.loadingTable') : t('upload.loadTable')}
                                 </Button>
                                 {hasMultipleFileTables && (
                                     <Button
                                         variant="contained"
                                         onClick={handleFileLoadAllTables}
-                                        disabled={filePreviewLoading}
+                                        disabled={filePreviewLoading || tableLoading}
+                                        startIcon={tableLoading ? <CircularProgress size={16} color="inherit" /> : undefined}
                                         sx={{ textTransform: 'none', width: 240 }}
                                     >
-                                        Load All Tables
+                                        {tableLoading ? t('upload.loadingTable') : t('upload.loadAllTables')}
                                     </Button>
                                 )}
                             </Box>
@@ -1132,27 +2201,34 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                         p: 2,
                         justifyContent: showUrlPreview ? 'flex-start' : 'center',
                     }}>
-                        <Box sx={{ width: '100%', maxWidth: showUrlPreview ? '80%' : 760, alignSelf: 'center', display: 'flex', flexDirection: 'column', gap: 2 }}>
-                            {/* URL Input */}
-                            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
-                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                        <Box sx={{
+                            width: '100%',
+                            maxWidth: showUrlPreview ? '90%' : (showExamples ? 1000 : 640),
+                            alignSelf: 'center',
+                            display: 'grid',
+                            gridTemplateColumns: showExamples && !showUrlPreview ? 'minmax(0, 1fr) minmax(0, 1fr)' : '1fr',
+                            columnGap: 4,
+                            rowGap: 1.5,
+                            alignItems: 'start',
+                        }}>
+                            {/* Left column: URL input + Watch Mode */}
+                            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5, minWidth: 0 }}>
+                                <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1 }}>
                                     <TextField
                                         fullWidth
-                                        placeholder="Enter URL: https://example.com/data.json or /api/data"
+                                        placeholder={t('upload.placeholder.url')}
                                         value={tableURL || ''}
                                         onChange={(e) => setTableURL((e.target.value || '').trim())}
                                         inputRef={urlInputRef}
                                         error={tableURL !== "" && !hasValidUrl}
-                                        helperText={tableURL !== "" && !hasValidUrl ? "Enter a valid URL starting with http://, https://, or /" : undefined}
+                                        helperText={tableURL !== "" && !hasValidUrl
+                                            ? t('upload.helperText.urlInvalid')
+                                            : t('upload.urlFormatHint')}
                                         size="small"
-                                        sx={{ 
+                                        sx={{
                                             flex: 1,
-                                            '& .MuiInputBase-input': {
-                                                fontSize: '0.875rem',
-                                            },
-                                            '& .MuiInputBase-input::placeholder': {
-                                                fontSize: '0.875rem',
-                                            },
+                                            '& .MuiInputBase-input, & .MuiInputBase-input::placeholder': { fontSize: '0.875rem' },
+                                            '& .MuiFormHelperText-root': { fontSize: '0.75rem', ml: 0.5 },
                                         }}
                                     />
                                     <Button
@@ -1160,19 +2236,14 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                                         size="small"
                                         onClick={() => handleURLPreview(tableURL || '')}
                                         disabled={!hasValidUrl || urlPreviewLoading}
-                                        sx={{ textTransform: 'none', whiteSpace: 'nowrap' }}
+                                        sx={{ textTransform: 'none', whiteSpace: 'nowrap', mt: '1px' }}
                                     >
-                                        Preview
+                                        {t('upload.preview')}
                                     </Button>
                                 </Box>
-                                <Typography variant="caption" color="text.secondary" sx={{ fontSize: '0.75rem', ml: 0.5 }}>
-                                    The URL must point to data in CSV, JSON, or JSONL format
-                                </Typography>
-                            </Box>
-                            
-                            {/* Watch/Auto-refresh options - always visible */}
-                            <Paper variant="outlined" sx={{ p: 2, borderRadius: 1 }}>
-                                <Box sx={{ display: 'flex', flexDirection: 'row', gap: 1, alignItems: 'center', height: 24 }}>
+
+                                {/* Watch mode — single inline row, no card wrapper. */}
+                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, flexWrap: 'wrap' }}>
                                     <FormControlLabel
                                         control={
                                             <Switch
@@ -1183,14 +2254,15 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                                         }
                                         label={
                                             <Typography component="span" variant="body2" sx={{ fontWeight: 500 }}>
-                                                Watch Mode
+                                                {t('upload.autoRefresh')}
                                             </Typography>
                                         }
+                                        sx={{ mr: 0.25 }}
                                     />
-                                    {urlAutoRefresh ? (
-                                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, }}>
-                                            <Typography variant="body2" color="text.secondary" sx={{ fontSize: '0.8rem' }}>
-                                                check data updates every
+                                    {urlAutoRefresh && (
+                                        <>
+                                            <Typography variant="caption" color="text.secondary" sx={{ ml: 0.5 }}>
+                                                every
                                             </Typography>
                                             {[
                                                 { seconds: 5, label: '5s' },
@@ -1202,83 +2274,110 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                                                 { seconds: 1800, label: '30m' },
                                                 { seconds: 3600, label: '1h' },
                                                 { seconds: 86400, label: '24h' },
-                                            ].map((opt) => (
-                                                <Chip
-                                                    key={opt.seconds}
-                                                    label={opt.label}
-                                                    size="small"
-                                                    variant={urlRefreshInterval === opt.seconds ? 'filled' : 'outlined'}
-                                                    color={urlRefreshInterval === opt.seconds ? 'primary' : 'default'}
-                                                    onClick={() => setUrlRefreshInterval(opt.seconds)}
-                                                    sx={{ 
-                                                        cursor: 'pointer', 
-                                                        fontSize: '0.7rem',
-                                                        height: 24,
-                                                    }}
-                                                />
-                                            ))}
-                                        </Box>
-                                    ) : <Typography component="span" variant="caption" color="text.secondary">
-                                        automatically check and refresh data from the URL at regular intervals
-                                    </Typography>}
-                                    
+                                            ].map((opt) => {
+                                                const selected = urlRefreshInterval === opt.seconds;
+                                                return (
+                                                    <Chip
+                                                        key={opt.seconds}
+                                                        label={opt.label}
+                                                        size="small"
+                                                        onClick={() => setUrlRefreshInterval(opt.seconds)}
+                                                        sx={{
+                                                            cursor: 'pointer',
+                                                            fontSize: '0.7rem',
+                                                            height: 20,
+                                                            border: 'none',
+                                                            bgcolor: selected ? 'primary.main' : 'transparent',
+                                                            color: selected ? 'primary.contrastText' : 'text.secondary',
+                                                            fontWeight: selected ? 600 : 400,
+                                                            '& .MuiChip-label': { px: 0.75 },
+                                                            '&:hover': { bgcolor: selected ? 'primary.dark' : 'action.hover' },
+                                                        }}
+                                                    />
+                                                );
+                                            })}
+                                        </>
+                                    )}
                                 </Box>
-                            </Paper>
+                            </Box>
 
-                            {/* Example APIs - Compact List */}
-                            {(!urlPreviewTables || urlPreviewTables.length === 0) && !urlPreviewLoading && (
-                                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
-                                    <Typography variant="caption" color="text.secondary" sx={{ mb: 0.5 }}>
-                                        Try examples:
+                            {/* Right column: example APIs. */}
+                            {showExamples && (
+                                <Box sx={{
+                                    display: 'flex',
+                                    flexDirection: 'column',
+                                    gap: 0.25,
+                                    minWidth: 0,
+                                    borderLeft: { md: '1px solid' },
+                                    borderColor: { md: 'divider' },
+                                    pl: { xs: 0, md: 3 },
+                                }}>
+                                    <Typography variant="caption" color="text.secondary" sx={{ mb: 0.5, fontWeight: 500 }}>
+                                        {t('upload.tryExamples')}
                                     </Typography>
-                                    <Box component="ul" sx={{ 
-                                        listStyle: 'none', 
-                                        padding: 0, 
-                                        margin: 0,
-                                        display: 'flex',
-                                        flexDirection: 'column',
-                                        gap: 0.25,
-                                    }}>
-                                        {exampleUrls.map((example) => (
-                                            <Box
-                                                component="li"
-                                                key={example.url}
+                                    {exampleUrls.map((example) => (
+                                        <Box
+                                            key={example.url}
+                                            sx={{ display: 'flex', alignItems: 'center', gap: 1, minWidth: 0 }}
+                                        >
+                                            <Typography
+                                                component="span"
+                                                variant="caption"
                                                 onClick={() => {
-                                                    console.log('example', example);
-                                                    if (example.url) {
-                                                        
-                                                        setTableURL(example.url);
-                                                        setUrlAutoRefresh(true);
-                                                        setUrlRefreshInterval(example.refreshSeconds || 60);
-                                                        handleURLPreview(example.url);
-                                                    }
+                                                    if (!example.url) return;
+                                                    setTableURL(example.url);
+                                                    setUrlAutoRefresh(true);
+                                                    setUrlRefreshInterval(example.refreshSeconds || 60);
+                                                    handleURLPreview(example.url);
                                                 }}
                                                 sx={{
+                                                    fontSize: '0.75rem',
+                                                    color: 'primary.main',
                                                     cursor: 'pointer',
-                                                    '&::before': {
-                                                        content: '"• "',
-                                                        color: 'text.secondary',
-                                                        marginRight: 0.5,
-                                                    }
+                                                    overflow: 'hidden',
+                                                    textOverflow: 'ellipsis',
+                                                    whiteSpace: 'nowrap',
+                                                    '&:hover': { textDecoration: 'underline' },
                                                 }}
                                             >
-                                                <Typography 
+                                                {example.label}
+                                            </Typography>
+                                            {example.resetUrl && (
+                                                <Typography
                                                     component="span"
-                                                    variant="caption" 
-                                                    sx={{ 
-                                                        fontSize: '0.75rem',
-                                                        color: 'primary.main',
-                                                        textDecoration: 'none',
-                                                        '&:hover': {
-                                                            textDecoration: 'underline',
-                                                        }
+                                                    variant="caption"
+                                                    onClick={(e) => {
+                                                        e.stopPropagation();
+                                                        apiRequest(`${window.location.origin}${example.resetUrl}`, { method: 'POST' })
+                                                            .then(() => {
+                                                                dispatch(dfActions.addMessages({
+                                                                    timestamp: Date.now(), type: 'success',
+                                                                    component: 'data upload', value: 'Example data reset successful',
+                                                                }));
+                                                            })
+                                                            .catch(() => {
+                                                                dispatch(dfActions.addMessages({
+                                                                    timestamp: Date.now(), type: 'error',
+                                                                    component: 'data upload', value: 'Failed to reset example data',
+                                                                }));
+                                                            });
+                                                    }}
+                                                    sx={{
+                                                        fontSize: '0.7rem',
+                                                        color: 'text.secondary',
+                                                        cursor: 'pointer',
+                                                        display: 'inline-flex',
+                                                        alignItems: 'center',
+                                                        gap: 0.25,
+                                                        '&:hover': { color: 'warning.main' },
                                                     }}
                                                 >
-                                                    {example.label}
+                                                    <RestartAltIcon sx={{ fontSize: iconVar.xs }} />
+                                                    {t('upload.resetLabel')}
                                                 </Typography>
-                                            </Box>
-                                        ))}
-                                    </Box>
+                                            )}
+                                        </Box>
+                                    ))}
                                 </Box>
                             )}
                         </Box>
@@ -1289,7 +2388,7 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                                     loading={urlPreviewLoading}
                                     error={urlPreviewError}
                                     tables={urlPreviewTables}
-                                    emptyLabel="Enter a URL and click Preview to see data."
+                                    emptyLabel={t('upload.enterUrlToPreview')}
                                     onRemoveTable={handleRemoveUrlPreviewTable}
                                     activeIndex={urlPreviewActiveIndex}
                                     onActiveIndexChange={setUrlPreviewActiveIndex}
@@ -1301,27 +2400,29 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                             <Box sx={{ display: 'flex', justifyContent: 'center', gap: 1, alignItems: 'center' }}>
                                 {urlAutoRefresh && (
                                     <Typography variant="caption" color="success.main" sx={{ mr: 1 }}>
-                                        <StreamIcon sx={{ fontSize: 14, verticalAlign: 'middle', mr: 0.5 }} />
-                                        Watch mode: {urlRefreshInterval < 60 ? `${urlRefreshInterval}s` : `${Math.floor(urlRefreshInterval / 60)}m`}
+                                        <StreamIcon sx={{ fontSize: iconVar.sm, verticalAlign: 'middle', mr: 0.5 }} />
+                                        {t('upload.watchModeStatus')} {urlRefreshInterval < 60 ? `${urlRefreshInterval}s` : `${Math.floor(urlRefreshInterval / 60)}m`}
                                     </Typography>
                                 )}
                                 <Button
                                     variant="contained"
                                     onClick={handleURLLoadSingleTable}
-                                    disabled={urlPreviewLoading}
+                                    disabled={urlPreviewLoading || tableLoading}
+                                    startIcon={tableLoading ? <CircularProgress size={16} color="inherit" /> : undefined}
                                     sx={{ textTransform: 'none', width: 240 }}
                                 >
-                                    Load Table
+                                    {tableLoading ? t('upload.loadingTable') : t('upload.loadTable')}
                                 </Button>
                                 {hasMultipleUrlTables && (
                                     <Button
                                         variant="contained"
                                         size="small"
                                         onClick={handleURLLoadAllTables}
-                                        disabled={urlPreviewLoading}
+                                        disabled={urlPreviewLoading || tableLoading}
+                                        startIcon={tableLoading ? <CircularProgress size={16} color="inherit" /> : undefined}
                                         sx={{ textTransform: 'none' }}
                                     >
-                                        Load All Tables
+                                        {tableLoading ? t('upload.loadingTable') : t('upload.loadAllTables')}
                                     </Button>
                                 )}
                             </Box>
@@ -1340,25 +2441,7 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                         justifyContent: hasPasteContent ? 'flex-start' : 'center',
                         alignItems: hasPasteContent ? 'stretch' : 'center',
                     }}>
-                        {isOverSizeLimit && (
-                            <Box sx={{ 
-                                display: 'flex', 
-                                alignItems: 'center', 
-                                mb: 1, 
-                                p: 1, 
-                                backgroundColor: 'rgba(244, 67, 54, 0.1)', 
-                                borderRadius: 1, 
-                                border: '1px solid rgba(244, 67, 54, 0.3)' 
-                            }}>
-                                <Typography variant="caption" sx={{ flex: 1, color: 'error.main', fontWeight: 500 }}>
-                                    ⚠️ Content exceeds {(MAX_CONTENT_SIZE / (1024 * 1024)).toFixed(0)}MB size limit. 
-                                    Current size: {(new Blob([pasteContent]).size / (1024 * 1024)).toFixed(2)}MB. 
-                                    Please use the DATABASE tab for large datasets.
-                                </Typography>
-                            </Box>
-                        )}
-                        
-                        {isLargeContent && !isOverSizeLimit && (
+                        {isLargeContent && (
                             <Box sx={{ 
                                 display: 'flex', 
                                 alignItems: 'center', 
@@ -1368,8 +2451,8 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                                 borderRadius: 1 
                             }}>
                                 <Typography variant="caption" sx={{ flex: 1 }}>
-                                    Large content detected ({Math.round(pasteContent.length / 1000)}KB). 
-                                    {showFullContent ? 'Showing full content (may be slow)' : 'Showing preview for performance'}
+                                    {t('upload.largeContentDetected', { size: Math.round(pasteContent.length / 1000) })}{' '}
+                                    {showFullContent ? t('upload.showingFullContent') : t('upload.showingPreview')}
                                 </Typography>
                                 <Button 
                                     size="small" 
@@ -1377,7 +2460,7 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                                     onClick={toggleFullContent}
                                     sx={{ textTransform: 'none', minWidth: 'auto' }}
                                 >
-                                    {showFullContent ? 'Show Preview' : 'Show Full'}
+                                    {showFullContent ? t('upload.showPreview') : t('upload.showFull')}
                                 </Button>
                             </Box>
                         )}
@@ -1389,9 +2472,9 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                                 fullWidth
                                 value={pasteContent}
                                 onChange={handleContentChange}
-                                placeholder="Paste your data here (CSV, TSV, or JSON format)"
-                                InputProps={{
-                                    readOnly: isLargeContent && !showFullContent,
+                                placeholder={t('upload.placeholder.paste')}
+                                slotProps={{
+                                    input: { readOnly: isLargeContent && !showFullContent },
                                 }}
                                 sx={{
                                     flex: hasPasteContent ? 1 : 'none',
@@ -1400,8 +2483,8 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                                         alignItems: 'flex-start',
                                     },
                                     '& .MuiInputBase-input': {
-                                        fontSize: 12,
-                                        fontFamily: 'monospace',
+                                        fontSize: textVar.sm,
+                                        fontFamily: 'var(--df-font-mono)',
                                         height: hasPasteContent ? '100% !important' : 'auto !important',
                                         overflow: 'auto !important',
                                     },
@@ -1421,7 +2504,7 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                                     border: `1px solid ${alpha(theme.palette.info.main, 0.2)}`
                                 }}>
                                     <Typography variant="caption" color="text.secondary" sx={{ fontSize: '0.7rem' }}>
-                                        Preview mode: Editing disabled. Click "Show Full" to enable editing.
+                                        {t('upload.previewMode')}
                                     </Typography>
                                 </Box>
                             )}
@@ -1431,96 +2514,123 @@ export const UnifiedDataUploadDialog: React.FC<UnifiedDataUploadDialogProps> = (
                             <Button
                                 variant="contained"
                                 onClick={handlePasteSubmit}
-                                disabled={(pasteContent || '').trim() === '' || isOverSizeLimit}
+                                disabled={(pasteContent || '').trim() === '' || tableLoading}
+                                startIcon={tableLoading ? <CircularProgress size={16} color="inherit" /> : undefined}
                                 sx={{ textTransform: 'none' }}
                             >
-                                Upload Data
+                                {tableLoading ? t('upload.loadingTable') : t('upload.uploadData')}
                             </Button>
                         </Box>
                     </Box>
                 </TabPanel>
 
-                {/* Database Tab */}
-                <TabPanel value={activeTab} index="database">
-                    {serverConfig.DISABLE_DATABASE ? (
-                        <Box sx={{ textAlign: 'center', py: 4, px: 2 }}>
-                            <Typography color="text.secondary" sx={{ mb: 2 }}>
-                                Database connection is disabled in this environment.
-                            </Typography>
-                            <Typography variant="body2" color="text.secondary">
-                                Install Data Formulator locally to use database features. <br />
-                                <Link 
-                                    href="https://github.com/microsoft/data-formulator" 
-                                    target="_blank" 
-                                    rel="noopener noreferrer"
-                                >
-                                    https://github.com/microsoft/data-formulator
-                                </Link>
-                            </Typography>
+                {/* Per-connector Tabs — one per registered instance */}
+                {connectorInstances.map((conn) => (
+                    <TabPanel key={conn.id} value={activeTab} index={`connector:${conn.id}` as UploadTabType}>
+                        <Box sx={{ height: '100%', minHeight: 0, display: 'flex' }}>
+                            <ScrollFadeContainer sx={{ p: 2, boxSizing: 'border-box' }} resetKey={conn.id}>
+                            <DataLoaderForm
+                                dataLoaderType={conn.id}
+                                loaderType={conn.icon}
+                                paramDefs={conn.params_form}
+                                authInstructions={conn.auth_instructions || ''}
+                                connectorId={conn.id}
+                                // Dialog never auto-connects: it's a
+                                // view/edit/re-auth surface for an existing
+                                // connector. Catalog browsing lives in the
+                                // data-source sidebar. Auto-connecting here
+                                // would close the dialog before the user
+                                // sees the form.
+                                autoConnect={false}
+                                ssoAutoConnect={false}
+                                delegatedLogin={conn.delegated_login}
+                                authMode={conn.auth_mode}
+                                authPaths={conn.auth_paths}
+                                hasStoredCredentials={conn.has_stored_credentials}
+                                onImport={() => {}}
+                                onAskAgent={handleAskAgent}
+                                onFinish={(status, message) => {
+                                    dispatch(dfActions.addMessages({
+                                        timestamp: Date.now(),
+                                        component: 'connector',
+                                        type: status === 'success' ? 'success' : 'error',
+                                        value: message,
+                                    }));
+                                }}
+                                onConnected={() => {
+                                    setConnectorInstances(prev =>
+                                        prev.map(c => c.id === conn.id ? { ...c, connected: true } : c)
+                                    );
+                                    onConnectorsChanged?.();
+                                    // Hand off to the data-source sidebar — the
+                                    // dialog no longer owns catalog browsing.
+                                    handleClose();
+                                    dispatch(dfActions.focusConnector(conn.id));
+                                }}
+                            />
+                            </ScrollFadeContainer>
                         </Box>
-                    ) : (
-                        <DBManagerPane />
-                    )}
+                    </TabPanel>
+                ))}
+
+                {/* Add Connection Tab */}
+                <TabPanel value={activeTab} index="add-connection">
+                    <AddConnectionPanel
+                        initialType={addConnectionInitialType}
+                        onAskAgent={handleAskAgent}
+                        onCreated={(newConnector) => {
+                            // Update connector list — card will appear on menu
+                            setConnectorInstances(prev => {
+                                const exists = prev.find(c => c.id === newConnector.id);
+                                if (exists) {
+                                    return prev.map(c => c.id === newConnector.id ? newConnector : c);
+                                }
+                                return [...prev, newConnector];
+                            });
+                            onConnectorsChanged?.();
+                            // Hand off to the data-source sidebar — the dialog
+                            // no longer owns catalog browsing.
+                            handleClose();
+                            dispatch(dfActions.focusConnector(newConnector.id));
+                        }}
+                    />
                 </TabPanel>
 
                 {/* Extract Data Tab */}
                 <TabPanel value={activeTab} index="extract">
-                    <DataLoadingChat />
+                    <DataLoadingChat onTableLoaded={handleClose} />
                 </TabPanel>
 
-                {/* Explore Sample Datasets Tab */}
-                <TabPanel value={activeTab} index="explore">
-                    <Box sx={{ p: 2, height: '100%', boxSizing: 'border-box', display: 'flex', flexDirection: 'column' }}>
-                        <DatasetSelectionView 
-                        datasets={datasetPreviews} 
-                        hideRowNum
-                        handleSelectDataset={(dataset) => {
-                            // Check if this is a live dataset
-                            const isLiveDataset = dataset.live === true;
-                            
-                            for (let table of dataset.tables) {
-                                // For live datasets with relative URLs, construct full URL
-                                let fullUrl = table.url;
-                                if (table.url.startsWith('/')) {
-                                    fullUrl = window.location.origin + table.url;
-                                }
-                                
-                                fetch(fullUrl)
-                                    .then(res => res.text())
-                                    .then(textData => {
-                                        let tableName = table.url.split("/").pop()?.split(".")[0]?.split("?")[0] || 'table-' + Date.now().toString().substring(0, 8);
-                                        let dictTable;
-                                        if (table.format == "csv") {
-                                            dictTable = createTableFromText(tableName, textData);
-                                        } else if (table.format == "json") {
-                                            dictTable = createTableFromFromObjectArray(tableName, JSON.parse(textData), true);
-                                        } 
-                                        if (dictTable) {
-                                            // For live datasets, set up as stream source with auto-refresh
-                                            if (isLiveDataset) {
-                                                dictTable.source = { 
-                                                    type: 'stream', 
-                                                    url: fullUrl,
-                                                    autoRefresh: true,
-                                                    refreshIntervalSeconds: dataset.refreshIntervalSeconds || 60,
-                                                    lastRefreshed: Date.now()
-                                                };
-                                            } else {
-                                                // Regular example data
-                                                dictTable.source = { type: 'example', url: table.url };
-                                            }
-                                            dispatch(dfActions.loadTable(dictTable));
-                                            dispatch(fetchFieldSemanticType(dictTable));
-                                        }
-                                    });
-                            }
-                            handleClose();
-                        }}
-                        />
-                    </Box>
-                </TabPanel>
+                {/* Local folder is no longer a dedicated tab — the "Link local
+                    folder" entry points open the Add Connection panel above
+                    with the local_folder loader pre-selected. */}
 
             </DialogContent>
+            <Dialog open={connectorPendingDelete !== null} onClose={() => setConnectorPendingDelete(null)} maxWidth="xs" fullWidth>
+                <DialogTitle>
+                    {t('sidebar.deleteConnectorTitle', { defaultValue: 'Delete connector' })}
+                </DialogTitle>
+                <DialogContent>
+                    <Typography sx={{ fontSize: textVar.md }}>
+                        {t('sidebar.deleteConnectorConfirm', {
+                            name: connectorPendingDelete?.display_name || '',
+                            defaultValue: 'Are you sure you want to delete "{{name}}"? Imported data will not be affected.',
+                        })}
+                    </Typography>
+                </DialogContent>
+                <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 1, px: 3, pb: 2 }}>
+                    <Button onClick={() => setConnectorPendingDelete(null)}>
+                        {t('cancel', { defaultValue: 'Cancel' })}
+                    </Button>
+                    <Button
+                        color="error"
+                        variant="contained"
+                        onClick={() => connectorPendingDelete && void deleteConnector(connectorPendingDelete)}
+                    >
+                        {t('sidebar.deleteConfirmBtn', { defaultValue: 'Delete' })}
+                    </Button>
+                </Box>
+            </Dialog>
         </Dialog>
     );
 };

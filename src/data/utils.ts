@@ -9,6 +9,19 @@ import { DictTable } from '../components/ComponentType';
 import { CoerceType, TestType, Type } from './types';
 import { ColumnTable } from './table';
 
+/**
+ * Read a File as text, trying UTF-8 first and falling back to GBK.
+ * Handles CSV/TSV files saved by Chinese-locale Excel (GBK) and similar cases.
+ */
+export const readFileText = async (file: File): Promise<string> => {
+    const buffer = await file.arrayBuffer();
+    try {
+        return new TextDecoder('utf-8', { fatal: true }).decode(buffer);
+    } catch {
+        return new TextDecoder('gbk').decode(buffer);
+    }
+};
+
 export const loadTextDataWrapper = (title: string, text: string, fileType: string): DictTable | undefined => {
     
     let tableName = title;
@@ -18,12 +31,12 @@ export const loadTextDataWrapper = (title: string, text: string, fileType: strin
     if (fileType == "text/csv" || fileType == "text/tab-separated-values") {
         table = createTableFromText(tableName, text);
     } else if (fileType == "application/json") {
-        table = createTableFromFromObjectArray(tableName, JSON.parse(text), true);
+        table = createTableFromFromObjectArray(tableName, JSON.parse(text));
     } 
     return table;
 };
 
-export const createTableFromText = (title: string, text: string, context?: string): DictTable | undefined => {
+export const createTableFromText = (title: string, text: string): DictTable | undefined => {
     // Check for empty strings, bad data, anything else?
     if (!text || text.trim() === '') {
         console.log('Invalid text provided for data. Could not load.');
@@ -76,16 +89,14 @@ export const createTableFromText = (title: string, text: string, context?: strin
         return record;
     });
 
-    return createTableFromFromObjectArray(title, records, true, undefined, context);
+    return createTableFromFromObjectArray(title, records);
 };
 
-export const createTableFromFromObjectArray = (title: string, values: any[], anchored: boolean, derive?: any, context?: string): DictTable => {
+export const createTableFromFromObjectArray = (title: string, values: any[], derive?: any): DictTable => {
     /*
     * title: the title of the table
     * values: the values of the table
-    * anchored: whether the table is anchored
     * derive: the derive of the table
-    * context: the context of the table that will be attached to table metadata
     */
 
     const len = values.length;
@@ -117,7 +128,7 @@ export const createTableFromFromObjectArray = (title: string, values: any[], anc
             for (let r = 0; r < len; r++) {
                 col.push(values[r][names[i]]);
             }
-            const type = inferTypeFromValueArray(col);
+            const type = refineTemporalType(col, inferTypeFromValueArray(col));
             col = coerceValueArrayFromTypes(col, type);
             columns.set(cleanNames[i], new Column(col, type));
         }
@@ -126,6 +137,7 @@ export const createTableFromFromObjectArray = (title: string, values: any[], anc
     let columnTable = new ColumnTable(columns, cleanNames);
 
     return  {
+        kind: 'table' as const,
         id: title,
         displayId: `${title}`,
         names: columnTable.names(),
@@ -133,26 +145,30 @@ export const createTableFromFromObjectArray = (title: string, values: any[], anc
             ...acc,
             [name]: {
                 type: (columnTable.column(name) as Column).type,
-                semanticType: "",
                 levels: []
             }
         }), {}),
         rows: columnTable.objects(),
         derive: derive,
-        anchored: anchored,
-        createdBy: "user",
-        attachedMetadata: context || ''
+        virtual: { tableId: title, rowCount: len },
+        description: ''
     }
 };
 
 export const inferTypeFromValueArray = (values: any[]): Type => {
-    let types: Type[] = [Type.Boolean, Type.Integer, Type.Date, Type.Number, Type.String];
+    // More specific types first; the first surviving candidate wins.
+    let types: Type[] = [
+        Type.Boolean, Type.Integer,
+        Type.DateTime, Type.Date, Type.Time, Type.Duration,
+        Type.Number, Type.String,
+    ];
 
     for (let i = 0; i < values.length; i++) {
         const v = values[i];
+        if (v == null || v === '') continue;
 
         for (let t = 0; t < types.length; t++) {
-            if (v != null && !TestType[types[t]](v)) {
+            if (!TestType[types[t]](v)) {
                 types.splice(t, 1);
                 t -= 1;
             }
@@ -162,14 +178,40 @@ export const inferTypeFromValueArray = (values: any[]): Type => {
     return types[0];
 };
 
+/**
+ * Downgrade DateTime to Date when every non-null value has a zero time component.
+ * Call this on a column AFTER type inference to refine the temporal precision.
+ */
+export const refineTemporalType = (values: any[], inferredType: Type): Type => {
+    if (inferredType !== Type.DateTime) return inferredType;
+    const nonNull = values.filter(v => v != null && v !== '');
+    if (nonNull.length === 0) return inferredType;
+    const allMidnight = nonNull.every(v => {
+        if (typeof v !== 'string') return false;
+        const tIdx = v.indexOf('T');
+        if (tIdx === -1) return false;
+        const timePart = v.slice(tIdx + 1).replace(/[Z+-].*$/, '');
+        const parts = timePart.split(':');
+        return parts.length >= 2 && parts.every(p => parseFloat(p) === 0);
+    });
+    return allMidnight ? Type.Date : Type.DateTime;
+};
+
 export const convertTypeToDtype = (type: Type | undefined): string => {
-    return type === Type.Integer || type === Type.Number
-        ? 'quantitative'
-        : type === Type.Boolean
-        ? 'boolean'
-        : type === Type.Date
-        ? 'date'
-        : 'nominal';
+    switch (type) {
+        case Type.Integer:
+        case Type.Number:
+        case Type.Duration:
+            return 'quantitative';
+        case Type.Boolean:
+            return 'boolean';
+        case Type.Date:
+        case Type.DateTime:
+        case Type.Time:
+            return 'date';
+        default:
+            return 'nominal';
+    }
 };
 
 export const coerceValueArrayFromTypes = (values: any[], type: Type): any[] => {
@@ -195,6 +237,25 @@ export function tupleEqual(a: any[], b: any[]) {
     return true;
 }
 
+export const resolveExcelCellValue = (value: any): string | number | boolean | null => {
+    if (value == null) return null;
+    if (value instanceof Date) return value.toISOString();
+    if (typeof value === 'object') {
+        if (value.richText) {
+            return value.richText.map((rt: any) => rt.text ?? '').join('');
+        }
+        if (value.hyperlink != null) {
+            return value.text || value.hyperlink;
+        }
+        if (value.formula !== undefined) {
+            return resolveExcelCellValue(value.result);
+        }
+        if (value.error) return null;
+        return String(value);
+    }
+    return value;
+};
+
 export const loadBinaryDataWrapper = async (title: string, arrayBuffer: ArrayBuffer): Promise<DictTable[]> => {
     try {
         // Read the Excel file
@@ -212,7 +273,7 @@ export const loadBinaryDataWrapper = async (title: string, arrayBuffer: ArrayBuf
                 const headerRow = worksheet.getRow(1);
                 const headers: string[] = [];
                 headerRow.eachCell((cell, colNumber) => {
-                    headers[colNumber - 1] = cell.value?.toString() || `Column${colNumber}`;
+                    headers[colNumber - 1] = resolveExcelCellValue(cell.value)?.toString() || `Column${colNumber}`;
                 });
 
                 if (headers.length === 0) {
@@ -226,7 +287,7 @@ export const loadBinaryDataWrapper = async (title: string, arrayBuffer: ArrayBuf
                     const rowData: any = {};
                     row.eachCell((cell, colNumber) => {
                         const header = headers[colNumber - 1] || `Column${colNumber}`;
-                        rowData[header] = cell.value;
+                        rowData[header] = resolveExcelCellValue(cell.value);
                     });
 
                     // Only add row if it has data
@@ -240,7 +301,7 @@ export const loadBinaryDataWrapper = async (title: string, arrayBuffer: ArrayBuf
                 }
 
                 // Create a table from the JSON data with sheet name included in the title
-                const sheetTable = createTableFromFromObjectArray(`${title}-${worksheet.name}`, jsonData, true);
+                const sheetTable = createTableFromFromObjectArray(`${title}-${worksheet.name}`, jsonData);
                 tables.push(sheetTable);
             } catch (error) {
                 console.error(`Error processing sheet ${worksheet.name}:`, error);

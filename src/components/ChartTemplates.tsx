@@ -1,632 +1,156 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+/**
+ * Chart Templates with UI icons.
+ *
+ * This module wraps the reusable flint-chart template definitions
+ * with React icon components for display in the Data Formulator UI.
+ * The pure template logic (mark, encoding paths, post-processors) lives
+ * in the flint-chart package.
+ */
+
 import { ChartTemplate } from "./ComponentType";
+import {
+    vlTemplateDefs,
+    vlGetTemplateChannels,
+} from "flint-chart";
 import InsightsIcon from '@mui/icons-material/Insights';
-import PublicIcon from '@mui/icons-material/Public';
-import PieChartOutlineIcon from '@mui/icons-material/PieChartOutline';
 import React from "react";
 
 // Import all chart icons statically so they are included in the build
-import chartIconTable from '../assets/chart-icon-table-min.png';
-import chartIconScatter from '../assets/chart-icon-scatter-min.png';
-import chartIconLinearRegression from '../assets/chart-icon-linear-regression-min.png';
-import chartIconDotPlotHorizontal from '../assets/chart-icon-dot-plot-horizontal-min.png';
-import chartIconBoxPlot from '../assets/chart-icon-box-plot-min.png';
-import chartIconColumn from '../assets/chart-icon-column-min.png';
-import chartIconColumnGrouped from '../assets/chart-icon-column-grouped-min.png';
-import chartIconColumnStacked from '../assets/chart-icon-column-stacked-min.png';
-import chartIconHistogram from '../assets/chart-icon-histogram-min.png';
-import chartIconHeatMap from '../assets/chart-icon-heat-map-min.png';
-import chartIconLine from '../assets/chart-icon-line-min.png';
-import chartIconDottedLine from '../assets/chart-icon-dotted-line-min.png';
-import chartIconCustomPoint from '../assets/chart-icon-custom-point-min.png';
-import chartIconCustomLine from '../assets/chart-icon-custom-line-min.png';
-import chartIconCustomBar from '../assets/chart-icon-custom-bar-min.png';
-import chartIconCustomRect from '../assets/chart-icon-custom-rect-min.png';
-import chartIconCustomArea from '../assets/chart-icon-custom-area-min.png';
-import chartIconPie from '../assets/chart-icon-pie-min.png';
+import chartIconScatter from '../assets/chart-icon-scatter.svg';
+import chartIconLinearRegression from '../assets/chart-icon-linear-regression.svg';
+import chartIconDotPlotHorizontal from '../assets/chart-icon-dot-plot-horizontal.svg';
+import chartIconBoxPlot from '../assets/chart-icon-box-plot.svg';
+import chartIconColumn from '../assets/chart-icon-column.svg';
+import chartIconColumnGrouped from '../assets/chart-icon-column-grouped.svg';
+import chartIconColumnStacked from '../assets/chart-icon-column-stacked.svg';
+import chartIconHistogram from '../assets/chart-icon-histogram.svg';
+import chartIconHeatMap from '../assets/chart-icon-heat-map.svg';
+import chartIconLine from '../assets/chart-icon-line.svg';
+import chartIconCustomPoint from '../assets/chart-icon-custom-point.svg';
+import chartIconCustomLine from '../assets/chart-icon-custom-line.svg';
+import chartIconCustomBar from '../assets/chart-icon-custom-bar.svg';
+import chartIconCustomRect from '../assets/chart-icon-custom-rect.svg';
+import chartIconCustomArea from '../assets/chart-icon-custom-area.svg';
+import chartIconArea from '../assets/chart-icon-area.svg';
+import chartIconStreamgraph from '../assets/chart-icon-streamgraph.svg';
+import chartIconDensity from '../assets/chart-icon-density.svg';
+import chartIconLollipop from '../assets/chart-icon-lollipop.svg';
+import chartIconPie from '../assets/chart-icon-pie.svg';
 import chartIconUSMap from '../assets/chart-icon-us-map-min.png';
-import chartIconPyramid from '../assets/chart-icon-pyramid-min.png';
+import chartIconPyramid from '../assets/chart-icon-pyramid.svg';
 import chartIconWorldMap from '../assets/chart-icon-world-map-min.png';
+import chartIconCandlestick from '../assets/chart-icon-candlestick.svg';
+import chartIconWaterfall from '../assets/chart-icon-waterfall.svg';
+import chartIconStripPlot from '../assets/chart-icon-strip-plot.svg';
+import chartIconRadar from '../assets/chart-icon-radar.svg';
+import chartIconBump from '../assets/chart-icon-bump.svg';
+import chartIconRose from '../assets/chart-icon-rose.svg';
+import chartIconBarTable from '../assets/chart-icon-bar-table.svg';
+import chartIconKpiCard from '../assets/chart-icon-kpi-card.svg';
+// Borrowed from the flint-chart gallery (same flat line-art design language) for
+// types that previously fell back to the generic placeholder.
+import chartIconConnectedScatter from '../assets/chart-icon-connected-scatter.svg';
+import chartIconGantt from '../assets/chart-icon-gantt.svg';
+import chartIconBullet from '../assets/chart-icon-bullet.svg';
+import chartIconEcdf from '../assets/chart-icon-ecdf.svg';
+import chartIconViolin from '../assets/chart-icon-violin.svg';
+import chartIconSlope from '../assets/chart-icon-slope.svg';
+import chartIconSparkline from '../assets/chart-icon-sparkline.svg';
+import chartIconRangeArea from '../assets/chart-icon-range-area.svg';
+// Generic fallback for chart types without a bespoke icon (matches the flat
+// line-art language of the others: dark axes + muted bars + a blue trend line).
+import chartIconPlaceholder from '../assets/chart-icon-placeholder.svg';
 
 // Chart Icon Component using static imports
 const ChartIcon: React.FC<{ src: string; alt?: string }> = ({ src, alt = "" }) => {
-  return <img src={src} alt={alt} style={{ width: '100%', height: '100%', objectFit: 'contain' }} />;
+    return <img src={src} alt={alt} style={{ width: '100%', height: '100%', objectFit: 'contain' }} />;
 };
+
+// ---------------------------------------------------------------------------
+// Icon mapping: chart name → React icon element
+// ---------------------------------------------------------------------------
+
+export const CHART_ICONS: Record<string, React.ReactElement> = {
+    "Auto": <InsightsIcon color="primary" />,
+    "Scatter Plot": <ChartIcon src={chartIconScatter} />,
+    "Regression": <ChartIcon src={chartIconLinearRegression} />,
+    "Ranged Dot Plot": <ChartIcon src={chartIconDotPlotHorizontal} />,
+    "Boxplot": <ChartIcon src={chartIconBoxPlot} />,
+    "Bar Chart": <ChartIcon src={chartIconColumn} />,
+    "Bar Table": <ChartIcon src={chartIconBarTable} />,
+    "Pyramid Chart": <ChartIcon src={chartIconPyramid} />,
+    "Grouped Bar Chart": <ChartIcon src={chartIconColumnGrouped} />,
+    "Stacked Bar Chart": <ChartIcon src={chartIconColumnStacked} />,
+    "Histogram": <ChartIcon src={chartIconHistogram} />,
+    "Heatmap": <ChartIcon src={chartIconHeatMap} />,
+    "US Map": <ChartIcon src={chartIconUSMap} />,
+    "World Map": <ChartIcon src={chartIconWorldMap} />,
+    "Pie Chart": <ChartIcon src={chartIconPie} />,
+    "Rose Chart": <ChartIcon src={chartIconRose} />,
+    "Line Chart": <ChartIcon src={chartIconLine} />,
+    "Bump Chart": <ChartIcon src={chartIconBump} />,
+    "Area Chart": <ChartIcon src={chartIconArea} />,
+    "Streamgraph": <ChartIcon src={chartIconStreamgraph} />,
+    "Lollipop Chart": <ChartIcon src={chartIconLollipop} />,
+    "Density Plot": <ChartIcon src={chartIconDensity} />,
+    "Candlestick Chart": <ChartIcon src={chartIconCandlestick} />,
+    "Waterfall Chart": <ChartIcon src={chartIconWaterfall} />,
+    "Strip Plot": <ChartIcon src={chartIconStripPlot} />,
+    "Radar Chart": <ChartIcon src={chartIconRadar} />,
+    "KPI Card": <ChartIcon src={chartIconKpiCard} />,
+    // Borrowed from the flint-chart gallery (see imports above).
+    "Connected Scatter Plot": <ChartIcon src={chartIconConnectedScatter} />,
+    "Gantt Chart": <ChartIcon src={chartIconGantt} />,
+    "Bullet Chart": <ChartIcon src={chartIconBullet} />,
+    "ECDF Plot": <ChartIcon src={chartIconEcdf} />,
+    "Violin Plot": <ChartIcon src={chartIconViolin} />,
+    "Slope Chart": <ChartIcon src={chartIconSlope} />,
+    "Sparkline": <ChartIcon src={chartIconSparkline} />,
+    "Range Area Chart": <ChartIcon src={chartIconRangeArea} />,
+    "Map": <ChartIcon src={chartIconWorldMap} />,
+    "Choropleth": <ChartIcon src={chartIconUSMap} />,
+    "Custom Point": <ChartIcon src={chartIconCustomPoint} />,
+    "Custom Line": <ChartIcon src={chartIconCustomLine} />,
+    "Custom Bar": <ChartIcon src={chartIconCustomBar} />,
+    "Custom Rect": <ChartIcon src={chartIconCustomRect} />,
+    "Custom Area": <ChartIcon src={chartIconCustomArea} />,
+};
+
+// ---------------------------------------------------------------------------
+// Build CHART_TEMPLATES by adding icons to library template defs
+// ---------------------------------------------------------------------------
+
+function addIcons(defs: { chart: string }[]): ChartTemplate[] {
+    return defs.map(def => ({
+        ...def,
+        icon: CHART_ICONS[def.chart] || <ChartIcon src={chartIconPlaceholder} />,
+    })) as ChartTemplate[];
+}
+
+export const CHART_TEMPLATES: { [key: string]: ChartTemplate[] } = Object.fromEntries(
+    Object.entries(vlTemplateDefs).map(([category, defs]) => [
+        category,
+        addIcons(defs),
+    ])
+);
+
+// ---------------------------------------------------------------------------
+// Re-exports for backward compatibility
+// ---------------------------------------------------------------------------
+
+// Re-export constants and utilities from the chart engine library
+export {
+    channels,
+    channelGroups,
+} from 'flint-chart';
 
 export function getChartTemplate(chartType: string): ChartTemplate | undefined {
     return Object.values(CHART_TEMPLATES).flat().find(t => t.chart === chartType);
 }
 
-export const getChartChannels = (chartType: string) => {
-    return getChartTemplate(chartType)?.channels || []
-}
-
-export const CHANNEL_LIST =  ["x", "y", "x2", "y2", "id", "color", "opacity", "size", "shape", "column", 
-                              "row", "latitude", "longitude", "theta", "radius", "detail", "group",
-                              "field 1", "field 2", "field 3", "field 4", "field 5", 'field 6'] as const;
-
-/**
- * Ensures one axis (x or y) is nominal based on the spec and data cardinality.
- * If neither axis is nominal, converts the one with lower cardinality to nominal.
- * Returns "x" or "y" indicating which channel is nominal, or null if undetermined.
- */
-const ensureNominalAxis = (vgSpec: any, table: any[], defaultToX: boolean = true): "x" | "y" | null => {
-    if (vgSpec.encoding.x?.type === "nominal") {
-        return "x";
-    } else if (vgSpec.encoding.y?.type === "nominal") {
-        return "y";
-    } else if (vgSpec.encoding.x && vgSpec.encoding.y) {
-        // Neither are nominal, determine based on cardinality
-        if (table && table.length > 0) {
-            const xField = vgSpec.encoding.x?.field;
-            const yField = vgSpec.encoding.y?.field;
-            
-            let xCardinality = Infinity;
-            let yCardinality = Infinity;
-            
-            if (xField) {
-                const xValues = [...new Set(table.map(r => r[xField]))];
-                xCardinality = xValues.length;
-            }
-            
-            if (yField) {
-                const yValues = [...new Set(table.map(r => r[yField]))];
-                yCardinality = yValues.length;
-            }
-            
-            // The axis with lower cardinality should be nominal (categories)
-            if (xCardinality <= yCardinality) {
-                vgSpec.encoding.x.type = "nominal";
-                return "x";
-            } else {
-                vgSpec.encoding.y.type = "nominal";
-                return "y";
-            }
-        } else {
-            // Default based on parameter
-            if (defaultToX) {
-                vgSpec.encoding.x.type = "nominal";
-                return "x";
-            } else {
-                vgSpec.encoding.y.type = "nominal";
-                return "y";
-            }
-        }
-    } else if (vgSpec.encoding.x) {
-        // Only x is defined
-        if (vgSpec.encoding.x.type !== "nominal") {
-            vgSpec.encoding.x.type = "nominal";
-        }
-        return "x";
-    } else if (vgSpec.encoding.y) {
-        // Only y is defined
-        if (vgSpec.encoding.y.type !== "nominal") {
-            vgSpec.encoding.y.type = "nominal";
-        }
-        return "y";
-    }
-    return null;
-};
-
-export const ChannelGroups = {
-        "": ["x", "y", "x2", "y2", "latitude", "longitude", "id", "radius", "theta", "detail"],
-        "legends": ["color", "group", "size", "shape", "text", "opacity" ],
-        "facets": ["column", "row"],
-        "data fields": ["field 1", "field 2", "field 3", "field 4", "field 5", 'field 6']
-}
-
-const tablePlots: ChartTemplate[] = [
-    {
-        "chart": "Auto",
-        "icon": <InsightsIcon color="primary" />,
-        "template": { },
-        "channels": [],
-        "paths": { }
-    },
-    {
-        "chart": "Table",
-        "icon": <ChartIcon src={chartIconTable} />,
-        "template": { },
-        "channels": [], //"field 1", "field 2", "field 3", "field 4", "field 5", 'field 6'
-        "paths": { }
-    },
-]
-
-const scatterPlots: ChartTemplate[] = [
-    {
-        "chart": "Scatter Plot",
-        "icon": <ChartIcon src={chartIconScatter} />,
-        "template": {
-            "mark": "circle",
-            "encoding": { }
-        },
-        "channels": ["x", "y", "color", "size", "opacity", "column", "row"],
-        "paths": {
-            "x": ["encoding", "x"],
-            "y": ["encoding", "y"],
-            "color": ["encoding", "color"],
-            "size": ["encoding", "size"],
-            "opacity": ["encoding", "opacity"],
-            "column": ["encoding", "column"],
-            "row": ["encoding", "row"]
-        }
-    },
-    {
-        "chart": "Linear Regression",
-        "icon": <ChartIcon src={chartIconLinearRegression} />,
-        "template": {
-            "layer": [
-                {
-                  "mark": "circle",
-                  "encoding": { "x": {}, "y": {}, "color": {}, "size": {} }
-                },
-                {
-                  "mark": {
-                    "type": "line", "color": "red"
-                  },
-                  "transform": [
-                    {
-                      "regression": "field1",
-                      "on": "field2",
-                      "group": "field3"
-                    }
-                  ],
-                  "encoding": {
-                    "x": {},
-                    "y": {}
-                  }
-                }
-              ]
-        },
-        "channels": ["x", "y", "size", "color", "column"],
-        "paths": {
-            "x": [["layer", 0, "encoding", "x"], ["layer", 1, "encoding", "x"], ["layer", 1, "transform", 0, "on"]],
-            "y": [["layer", 0, "encoding", "y"], ["layer", 1, "encoding", "y"], ["layer", 1, "transform", 0, "regression"]],
-            "color": ["layer", 0, "encoding", "color"],
-            "size": ["layer", 0, "encoding", "size"]
-        }
-    },
-    {
-        "chart": "Ranged Dot Plot",
-        "icon": <ChartIcon src={chartIconDotPlotHorizontal} />,
-        "template": {
-            "encoding": { },
-            "layer": [
-                {
-                    "mark": "line",
-                    "encoding": {
-                        "detail": { },
-                    }
-                },
-                {
-                    "mark": {
-                        "type": "point",
-                        "filled": true
-                    },
-                    "encoding": {
-                        "color": {}
-                    }
-                }
-            ]
-        },
-        "channels": ["x", "y", "color"],
-        "paths": {
-            "x": ["encoding", "x"],
-            "y": ["encoding", "y"],
-            "color": ["layer", 1, "encoding", "color"]
-        },
-        "postProcessor": (vgSpec: any,  table: any[]) => {
-            if (vgSpec.encoding.y?.type == "nominal") {
-                vgSpec['layer'][0]['encoding']['detail'] = JSON.parse(JSON.stringify(vgSpec['encoding']['y']))
-            } else if (vgSpec.encoding.x?.type == "nominal") {
-                vgSpec['layer'][0]['encoding']['detail'] = JSON.parse(JSON.stringify(vgSpec['encoding']['x']))
-            } else {
-                
-            }
-            return vgSpec;
-        }
-    }, 
-    {
-        "chart": "Boxplot",
-        "icon": <ChartIcon src={chartIconBoxPlot} />,
-        "template": {
-            "mark": "boxplot",
-            "encoding": { }
-        },
-        "channels": ["x", "y", "color", "opacity", "column", "row"],
-        "paths": Object.fromEntries(["x", "y", "color", "opacity", "column", "row"].map(channel => [channel, ["encoding", channel]])),
-        "postProcessor": (vgSpec: any,  table: any[]) => {
-            const hasX = vgSpec.encoding.x?.field;
-            const hasY = vgSpec.encoding.y?.field;
-            
-            // If only one axis is defined, show a helpful message
-            if (hasX && hasY) {
-                // Both axes defined - determine which should be nominal
-                // Vertical boxplot: x is nominal, y is quantitative
-                // Horizontal boxplot: y is nominal, x is quantitative
-                ensureNominalAxis(vgSpec, table, true);
-            }
-            return vgSpec;
-        }
-    }
-]
-
-const barCharts: ChartTemplate[] = [
-    {
-        "chart": "Bar Chart",
-        "icon": <ChartIcon src={chartIconColumn} />,
-        "template": {
-            "mark": "bar",
-            "encoding": { }
-        },
-        "channels": ["x", "y", "color", "opacity", "column", "row"],
-        "paths": {
-            "x": ["encoding", "x"],
-            "y": ["encoding", "y"],
-            "color": ["encoding", "color"],
-            "opacity": ["encoding", "opacity"],
-            "column": ["encoding", "column"],
-            "row": ["encoding", "row"]
-        }
-    },
-    {
-        "chart": "Pyramid Chart",
-        "icon": <ChartIcon src={chartIconPyramid} />,
-        "template": {
-            "spacing": 0,
-            "resolve": {"scale": {"y": "shared"}},
-            "hconcat": [{
-                "mark": "bar",
-                "encoding": {
-                    "y": { },
-                    "x": { "scale": {"reverse": true}, "stack": null},
-                    "color": {  "legend": null },
-                    "opacity": {"value": 0.9}
-                }
-            }, {
-                "mark": "bar",
-                "encoding": {
-                    "y": {"axis": null},
-                    "x": {"stack": null},
-                    "color": { "legend": null},
-                    "opacity": {"value": 0.9},
-                }
-            }],
-            "config": {
-                "view": {"stroke": null},
-                "axis": {"grid": false}
-            },
-        },
-        "channels": ["x", "y", "color"],
-        "paths": {
-            "x": [["hconcat", 0, "encoding", "x"], ["hconcat", 1, "encoding", "x"]],
-            "y": [["hconcat", 0, "encoding", "y"], ["hconcat", 1, "encoding", "y"]],
-            "color": [["hconcat", 0, "encoding", "color"], ["hconcat", 1, "encoding", "color"]],
-        },
-        "postProcessor": (vgSpec: any, table: any[]) => {
-            try {
-                if (table) {
-                    let colorField = vgSpec['hconcat'][0]['encoding']['color']['field'];
-                    let colorValues = [...new Set(table.map(r => r[colorField]))] ;
-                    vgSpec.hconcat[0].transform = [{"filter": `datum[\"${colorField}\"] == \"${colorValues[0]}\"`}]
-                    vgSpec.hconcat[0].title = colorValues[0]
-                    vgSpec.hconcat[1].transform = [{"filter": `datum[\"${colorField}\"] == \"${colorValues[1]}\"`}]
-                    vgSpec.hconcat[1].title = colorValues[1]
-                    let xField = vgSpec['hconcat'][0]['encoding']['x']['field'];
-                    let xValues = [...new Set(table.filter(r => r[colorField] == colorValues[0] || r[colorField] == colorValues[1]).map(r => r[xField]))];
-                    let domain = [Math.min(...xValues, 0), Math.max(...xValues)]
-                    vgSpec.hconcat[0]['encoding']['x']['scale']['domain'] = domain;
-                    vgSpec.hconcat[1]['encoding']['x']['scale'] = {domain: domain};
-                }
-            } catch {
-
-            }
-            return vgSpec;
-        }
-    },
-    {
-        "chart": "Grouped Bar Chart",
-        "icon": <ChartIcon src={chartIconColumnGrouped} />,
-        "template": {
-            "mark": "bar",
-            "encoding": {
-            }
-        },
-        "channels": ["x", "y", "color", "column", "row"],
-        "paths": {
-            "x": ["encoding", "x"],
-            "y": ["encoding", "y"],
-            "color": [["encoding", "color"]],
-            "column": ["encoding", "column"],
-            "row": ["encoding", "row"]
-        },
-        "postProcessor": (vgSpec: any, table: any[]) => {
-            if (!vgSpec.encoding.color?.field) return vgSpec;
-            
-            const nominalChannel = ensureNominalAxis(vgSpec, table, true);
-            const offsetChannel = nominalChannel === "x" ? "xOffset" : nominalChannel === "y" ? "yOffset" : null;
-            
-            if (nominalChannel && offsetChannel) {
-                if (!vgSpec.encoding[offsetChannel]) {
-                    vgSpec.encoding[offsetChannel] = {};
-                }
-                vgSpec.encoding[offsetChannel].field = vgSpec.encoding.color.field;
-                vgSpec.encoding[offsetChannel].type = "nominal";
-            }
-            return vgSpec;
-        }
-    },
-    {
-        "chart": "Stacked Bar Chart",
-        "icon": <ChartIcon src={chartIconColumnStacked} />,
-        "template": {
-            "mark": "bar",
-            "encoding": { }
-        },
-        "channels": ["x", "y", "color", "column", "row"],
-        "paths": {
-            "x": ["encoding", "x"],
-            "y": ["encoding", "y"],
-            "color": ["encoding", "color"],
-            "column": ["encoding", "column"],
-            "row": ["encoding", "row"]
-        }
-    },
-    {
-        "chart": "Histogram",
-        "icon": <ChartIcon src={chartIconHistogram} />,
-        "template": {
-            "mark": "bar",
-            "encoding": {
-            }
-        },
-        "channels": ["x", "y", "color", "column", "row"],
-        "paths": {
-            "x": ["encoding", "x"],
-            "y": ["encoding", "y"],
-            "color": ["encoding", "color"],
-            "column": ["encoding", "column"],
-            "row": ["encoding", "row"]
-        }
-    },
-    {
-        "chart": "Heatmap",
-        "icon": <ChartIcon src={chartIconHeatMap} />,
-        "template": {
-            "mark": "rect",
-            "encoding": {  }
-        },
-        "channels": ["x", "y", "color", "column", "row"],
-        "paths": Object.fromEntries(["x", "y", "color", "column", "row"].map(channel => [channel, ["encoding", channel]])),
-        "postProcessor": (vgSpec: any, table: any[]) => {
-            if (vgSpec.encoding.y && vgSpec.encoding.y.type != "nominal") {
-                vgSpec.encoding.y.type = "nominal";
-            } 
-            if (vgSpec.encoding.x && vgSpec.encoding.x.type != "nominal") {
-                vgSpec.encoding.x.type = "nominal";
-            } 
-            return vgSpec;
-        }
-    }
-]
-
-const mapCharts: ChartTemplate[] = [
-    {
-        "chart": "US Map",
-        "icon": <ChartIcon src={chartIconUSMap} />,
-        "template": {
-            "width": 500,
-            "height": 300,
-            "layer": [
-                {
-                    "data": {
-                        "url": "https://vega.github.io/vega-lite/data/us-10m.json",
-                        "format": {
-                            "type": "topojson",
-                            "feature": "states"
-                        }
-                    },
-                    "projection": {
-                        "type": "albersUsa"
-                    },
-                    "mark": {
-                        "type": "geoshape",
-                        "fill": "lightgray",
-                        "stroke": "white"
-                    }
-                },
-                {
-                    "projection": {
-                        "type": "albersUsa"
-                    },
-                    "mark": "circle",
-                    "encoding": {
-                        "longitude": { },
-                        "latitude": { },
-                        "size": {},
-                        "color": {}
-                    }
-                }
-            ]
-        },
-        "channels": ["longitude", "latitude", "color", "size"],
-        "paths": {
-            "longitude": ["layer", 1, "encoding", "longitude"],
-            "latitude": ["layer", 1, "encoding", "latitude"],
-            "color": ["layer", 1, "encoding", "color"],
-            "size": ["layer", 1, "encoding", "size"]
-        }
-    },
-    {
-        "chart": "World Map",
-        "icon": <ChartIcon src={chartIconWorldMap} />,
-        "template": {
-            "width": 600,
-            "height": 350,
-            "layer": [
-                {
-                    "data": {
-                        "url": "https://vega.github.io/vega-lite/data/world-110m.json",
-                        "format": {
-                            "type": "topojson",
-                            "feature": "countries"
-                        }
-                    },
-                    "projection": {
-                        "type": "equalEarth"
-                    },
-                    "mark": {
-                        "type": "geoshape",
-                        "fill": "lightgray",
-                        "stroke": "white"
-                    }
-                },
-                {
-                    "projection": {
-                        "type": "equalEarth"
-                    },
-                    "mark": "circle",
-                    "encoding": {
-                        "longitude": { },
-                        "latitude": { },
-                        "size": {},
-                        "color": {}
-                    }
-                }
-            ]
-        },
-        "channels": ["longitude", "latitude", "color", "size"],
-        "paths": {
-            "longitude": ["layer", 1, "encoding", "longitude"],
-            "latitude": ["layer", 1, "encoding", "latitude"],
-            "color": ["layer", 1, "encoding", "color"],
-            "size": ["layer", 1, "encoding", "size"]
-        }
-    }
-]
-
-const pieCharts: ChartTemplate[] = [
-    {
-        "chart": "Pie Chart",
-        "icon": <ChartIcon src={chartIconPie} />,
-        "template": {
-            "mark": "arc",
-            "encoding": { }
-        },
-        "channels": ["theta", "color", "column", "row"],
-        "paths": {
-            "theta": ["encoding", "theta"],
-            "color": ["encoding", "color"],
-            "column": ["encoding", "column"],
-            "row": ["encoding", "row"]
-        }
-    }
-]
-
-let lineCharts = [
-    {
-        "chart": "Line Chart",
-        "icon": <ChartIcon src={chartIconLine} />,
-        "template": {
-            "mark": "line",
-            "encoding": { }
-        },
-        "channels": ["x", "y", "color", "opacity", "column", "row"],
-        "paths": {
-            "x": ["encoding", "x"],
-            "y": ["encoding", "y"],
-            "color": ["encoding", "color"],
-            "opacity": ["encoding", "opacity"],
-            "column": ["encoding", "column"],
-            "row": ["encoding", "row"]
-        }
-    },
-    {
-        "chart": "Dotted Line Chart",
-        "icon": <ChartIcon src={chartIconDottedLine} />,
-        "template": {
-            "mark": {"type": "line", "point": true},
-            "encoding": { }
-        },
-        "channels": ["x", "y", "color", "column", "row"],
-        "paths": {
-            "x": ["encoding", "x"],
-            "y": ["encoding", "y"],
-            "color": ["encoding", "color"],
-            "opacity": ["encoding", "opacity"],
-            "column": ["encoding", "column"],
-            "row": ["encoding", "row"]
-        }
-    },
-]
-
-let customCharts = [
-    {
-        "chart": "Custom Point",
-        "icon": <ChartIcon src={chartIconCustomPoint} />,
-        "template": {
-            "mark": "point",
-            "encoding": { }
-        },
-        "channels": ["x", "y", "color", "opacity", "size", "shape", "column", "row"],
-        "paths": Object.fromEntries(["x", "y", "color", "opacity", "size", "shape", "column", "row"].map(channel => [channel, ["encoding", channel]]))
-    },
-    {
-        "chart": "Custom Line",
-        "icon": <ChartIcon src={chartIconCustomLine} />,
-        "template": {
-            "mark": "line",
-            "encoding": {  }
-        },
-        "channels": ["x", "y", "color", "opacity", "detail", "column", "row"],
-        "paths": Object.fromEntries(
-            [
-                ...["x", "y", "color", "opacity", "column", "row"].map(channel => [channel, ["encoding", channel]]),
-                ["detail", ["encoding", "detail"]]
-            ]
-        )
-    },
-    {
-        "chart": "Custom Bar",
-        "icon": <ChartIcon src={chartIconCustomBar} />,
-        "template": {
-            "mark": "bar",
-            "encoding": { }
-        },
-        "channels": ["x", "y", "color", "opacity", "size", "shape", "column", "row"],
-        "paths": Object.fromEntries(["x", "y", "color", "opacity", "size", "shape", "column", "row"].map(channel => [channel, ["encoding", channel]]))
-    }, 
-    {
-        "chart": "Custom Rect",
-        "icon": <ChartIcon src={chartIconCustomRect} />,
-        "template": {
-            "mark": "rect",
-            "encoding": { }
-        },
-        "channels": ["x", "y", "x2", "y2", "color", "opacity", "column", "row"],
-        "paths": Object.fromEntries(["x", "y", "x2", "y2", "color", "opacity", "column", "row"].map(channel => [channel, ["encoding", channel]]))
-    },
-    {
-        "chart": "Custom Area",
-        "icon": <ChartIcon src={chartIconCustomArea} />,
-        "template": {
-            "mark": "area",
-            "encoding": { }
-        },
-        "channels": ["x", "y", "x2", "y2", "color", "column", "row"],
-        "paths": Object.fromEntries(["x", "y", "x2", "y2", "color", "column", "row"].map(channel => [channel, ["encoding", channel]]))
-    }
-]
-
-
-export const CHART_TEMPLATES : {[key: string] : ChartTemplate[]} = {
-    "table": tablePlots,
-    "scatter": scatterPlots,
-    "bar": barCharts,
-    "map": mapCharts,
-    "pie": pieCharts,
-    "line": lineCharts,
-    "custom": customCharts,
+export const getChartChannels = (chartType: string): string[] => {
+    return vlGetTemplateChannels(chartType);
 }

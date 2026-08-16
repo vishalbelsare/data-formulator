@@ -1,73 +1,73 @@
 import json
 import logging
-from typing import Dict, Any, Optional, List
+import math
+from typing import Any
 
-import duckdb
-import pandas as pd
+import mssql_python
+import pyarrow as pa
 
-try:
-    import pyodbc
-    PYODBC_AVAILABLE = True
-except ImportError:
-    PYODBC_AVAILABLE = False
-
-from data_formulator.data_loader.external_data_loader import ExternalDataLoader, sanitize_table_name
-from data_formulator.security import validate_sql_query
+from data_formulator.data_loader.external_data_loader import ExternalDataLoader, CatalogNode, MAX_IMPORT_ROWS, sanitize_table_name
+from data_formulator.data_loader import probe_utils
+from data_formulator.datalake.parquet_utils import df_to_safe_records
 
 log = logging.getLogger(__name__)
 
-
 class MSSQLDataLoader(ExternalDataLoader):
+    DISPLAY_NAME = "SQL Server"
+    DESCRIPTION = "Connect to a Microsoft SQL Server database to query tables with SQL."
+
     @staticmethod
-    def list_params() -> bool:
+    def list_params() -> list[dict[str, Any]]:
         params_list = [
             {
                 "name": "server",
                 "type": "string",
                 "required": True,
                 "default": "localhost",
+                "tier": "connection",
                 "description": "SQL Server host address or instance name",
             },
             {
                 "name": "database",
                 "type": "string",
-                "required": True,
-                "default": "master",
-                "description": "Database name to connect to",
+                "required": False,
+                "default": "",
+                "tier": "filter",
+                "description": "Database name (leave empty to browse all databases)",
             },
             {
                 "name": "user",
                 "type": "string",
                 "required": False,
                 "default": "",
-                "description": "Username (leave empty for Windows Authentication)",
+                "tier": "auth",
+                "description": "Username (leave empty for Entra ID / Windows auth)",
             },
             {
                 "name": "password",
                 "type": "string",
                 "required": False,
                 "default": "",
-                "description": "Password (leave empty for Windows Authentication)",
+                "sensitive": True,
+                "tier": "auth",
+                "description": "Password (leave empty for Entra ID / Windows auth)",
             },
             {
                 "name": "port",
                 "type": "string",
                 "required": False,
                 "default": "1433",
+                "tier": "connection",
+                "advanced": True,
                 "description": "SQL Server port (default: 1433)",
-            },
-            {
-                "name": "driver",
-                "type": "string",
-                "required": False,
-                "default": "ODBC Driver 17 for SQL Server",
-                "description": "ODBC driver name",
             },
             {
                 "name": "encrypt",
                 "type": "string",
                 "required": False,
                 "default": "yes",
+                "tier": "connection",
+                "advanced": True,
                 "description": "Enable encryption (yes/no)",
             },
             {
@@ -75,6 +75,8 @@ class MSSQLDataLoader(ExternalDataLoader):
                 "type": "string",
                 "required": False,
                 "default": "no",
+                "tier": "connection",
+                "advanced": True,
                 "description": "Trust server certificate (yes/no)",
             },
             {
@@ -82,304 +84,340 @@ class MSSQLDataLoader(ExternalDataLoader):
                 "type": "string",
                 "required": False,
                 "default": "30",
+                "tier": "connection",
+                "advanced": True,
                 "description": "Connection timeout in seconds",
             },
         ]
         return params_list
 
-    @staticmethod
-    def auth_instructions() -> str:
-        return """
-SQL Server Connection Instructions:
+    @classmethod
+    def auth_paths(cls) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "entra_id",
+                "label": "Microsoft Entra ID",
+                "description": (
+                    "Run `az login` in your terminal, then connect with no "
+                    "password. Also works with Managed Identity, VS Code, and "
+                    "environment credentials."
+                ),
+                "fields": [],
+                "required_fields": [],
+                "kind": "ambient",
+                "default": True,
+                # In local mode the UI shows an in-app "Sign in with Azure CLI"
+                # button wired to these endpoints so users can az login without
+                # leaving the app.
+                "cli_login": {
+                    "provider": "azure",
+                    "label": "Sign in with Azure CLI",
+                    "status_url": "/api/local/azure-status",
+                    "login_url": "/api/local/azure-login",
+                },
+            },
+            {
+                "id": "sql_auth",
+                "label": "SQL Server authentication",
+                "description": "Sign in with a SQL Server username and password.",
+                "fields": ["user", "password"],
+                "required_fields": ["user", "password"],
+                "kind": "credentials",
+            },
+            {
+                "id": "windows_auth",
+                "label": "Windows authentication",
+                "description": "Use the host's Windows identity (Trusted Connection). Windows only.",
+                "fields": [],
+                "required_fields": [],
+                "kind": "ambient",
+            },
+        ]
 
-1. Prerequisites:
-   - Install pyodbc dependencies:
-     * macOS: brew install unixodbc
-     * Linux: sudo apt-get install unixodbc-dev (Ubuntu/Debian) or sudo yum install unixODBC-devel (CentOS/RHEL)
-     * Windows: Usually included with pyodbc installation
-   - Install pyodbc: pip install pyodbc
-   - Install Microsoft ODBC Driver for SQL Server:
-     * Windows: Usually pre-installed with SQL Server
-     * macOS: Download from Microsoft's official site or use: brew tap microsoft/mssql-release && brew install msodbcsql17
-     * Linux: Install via package manager (msodbcsql17 or msodbcsql18)
+    @classmethod
+    def infer_auth_path(cls, params: dict[str, Any]) -> str:
+        selected = str(params.get("_auth_path") or "").strip()
+        if selected:
+            return selected
+        if params.get("user") and params.get("password"):
+            return "sql_auth"
+        return "entra_id"
 
-2. Local SQL Server Setup:
-   - Ensure SQL Server is running on your machine
-   - Enable SQL Server Authentication if using username/password
-   - Default connection: server='localhost' or '.' or '(local)'
+    AUTH_GUIDE = "mssql.md"
 
-3. Connection Parameters:
-   - server: SQL Server instance (localhost, server\\instance, or IP address)
-   - database: Target database name (default: master)
-   - user: SQL Server username (leave empty for Windows Authentication)
-   - password: SQL Server password (leave empty for Windows Authentication)
-   - port: SQL Server port (default: 1433)
-   - driver: ODBC driver name (default: 'ODBC Driver 17 for SQL Server')
-
-4. Authentication Methods:
-   - Windows Authentication: Leave user/password empty (recommended for local development)
-   - SQL Server Authentication: Provide username and password
-   - Azure AD Authentication: Use appropriate connection parameters
-
-5. Connection Examples:
-   - Local default instance: server='localhost' or server='.'
-   - Named instance: server='localhost\\SQLEXPRESS'
-   - Remote server: server='192.168.1.100' or server='sql-server.company.com'
-   - Custom port: server='localhost,1434' (note the comma, not colon)
-
-6. Common Issues & Troubleshooting:
-   - If pyodbc import fails: Install unixodbc first (macOS/Linux)
-   - Ensure SQL Server service is running
-   - Check SQL Server Browser service for named instances
-   - Verify TCP/IP protocol is enabled in SQL Server Configuration Manager
-   - Check Windows Firewall settings for SQL Server port
-   - Test connection: `sqlcmd -S server -d database -U username -P password`
-   - For named instances, ensure SQL Server Browser service is running
-   - Check ODBC drivers: `odbcinst -q -d` (on Unix/Linux)
-
-7. Driver Installation:
-   - macOS: `brew install msodbcsql17` or download from Microsoft
-   - Ubuntu/Debian: `sudo apt-get install msodbcsql17`
-   - CentOS/RHEL: `sudo yum install msodbcsql17`
-   - Windows: Install SQL Server or download ODBC driver separately
-"""
-
-    def __init__(self, params: Dict[str, Any], duck_db_conn: duckdb.DuckDBPyConnection):
-        log.info("Initializing MSSQL DataLoader with parameters: %s", params)
-
-        if not PYODBC_AVAILABLE:
-            raise ImportError(
-                "pyodbc is required for MSSQL connections. "
-                "Install with: pip install pyodbc\n"
-                "Note for macOS: You may also need to run 'brew install unixodbc' first.\n"
-                "For other platforms, see: https://github.com/mkleehammer/pyodbc/wiki"
-            )
+    def __init__(self, params: dict[str, Any]):
+        from data_formulator.security.log_sanitizer import sanitize_params
+        log.info("Initializing MSSQL DataLoader with parameters: %s", sanitize_params(params))
 
         self.params = params
-        self.duck_db_conn = duck_db_conn
 
-        # Build connection string for pyodbc
-        self.connection_string = self._build_connection_string()
-        log.info("SQL Server connection string built")
+        self.server = params.get("server", "localhost")
+        self.database = params.get("database", "") or ""
+        self.user = params.get("user", "").strip()
+        self.password = params.get("password", "").strip()
+        self.port = params.get("port", "1433")
+        self.encrypt = params.get("encrypt", "yes")
+        self.trust_server_certificate = params.get("trust_server_certificate", "no")
+        self.connection_timeout = params.get("connection_timeout", "30")
 
-        # Test the connection
-        self._test_connection()
+        self.auth_path = params.get("_auth_path") or self.infer_auth_path(params)
 
-    def _build_connection_string(self) -> str:
-        """Build ODBC connection string from parameters"""
-        conn_parts = []
+        # When no database specified, connect to master for catalog browsing
+        connect_db = self.database or "master"
 
-        # Driver
-        driver = self.params.get("driver", "ODBC Driver 17 for SQL Server")
-        conn_parts.append(f"DRIVER={{{driver}}}")
+        # Build the auth-independent connection string. mssql-python uses
+        # Direct Database Connectivity, so no external ODBC driver is needed.
+        conn_str = (
+            f"SERVER={self.server},{self.port};"
+            f"DATABASE={connect_db};"
+            f"Encrypt={self.encrypt};"
+            f"TrustServerCertificate={self.trust_server_certificate};"
+        )
 
-        # Server (handle different server formats)
-        server = self.params.get("server", "localhost")
-        port = self.params.get("port", "1433")
-
-        # Handle different server formats
-        if "\\" in server:
-            # Named instance format: server\instance
-            conn_parts.append(f"SERVER={server}")
-        elif "," in server:
-            # Port already specified in server: server,port
-            conn_parts.append(f"SERVER={server}")
-        else:
-            # Standard format: add port if not default
-            if port and port != "1433":
-                conn_parts.append(f"SERVER={server},{port}")
-            else:
-                conn_parts.append(f"SERVER={server}")
-
-        # Database
-        database = self.params.get("database", "master")
-        conn_parts.append(f"DATABASE={database}")
-
-        # Authentication
-        user = self.params.get("user", "").strip()
-        password = self.params.get("password", "").strip()
-
-        if user:
-            conn_parts.append(f"UID={user}")
-            conn_parts.append(f"PWD={password}")
-        else:
-            # Use Windows Authentication
-            conn_parts.append("Trusted_Connection=yes")
-
-        # Connection settings
-        encrypt = self.params.get("encrypt", "yes")
-        trust_cert = self.params.get("trust_server_certificate", "no")
-        timeout = self.params.get("connection_timeout", "30")
-
-        conn_parts.append(f"Encrypt={encrypt}")
-        conn_parts.append(f"TrustServerCertificate={trust_cert}")
-        conn_parts.append(f"Connection Timeout={timeout}")
-
-        return ";".join(conn_parts)
-
-    def _test_connection(self):
-        """Test the SQL Server connection"""
         try:
-            with pyodbc.connect(self.connection_string, timeout=10) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT @@VERSION")
-                version = cursor.fetchone()[0]
-                log.info(f"SQL Server connection successful. Version: {version[:50]}...")
+            connection_timeout = max(1, int(self.connection_timeout))
+        except (TypeError, ValueError) as e:
+            raise ValueError("Connection timeout must be a positive number of seconds") from e
+
+        if self.auth_path == "entra_id":
+            conn_str += "Authentication=ActiveDirectoryDefault;"
+        elif self.user or self.auth_path == "sql_auth":
+            conn_str += f"Authentication=SqlPassword;UID={self.user};PWD={self.password};"
+        else:
+            conn_str += "Trusted_Connection=yes;"
+
+        try:
+            self._conn = mssql_python.connect(conn_str, timeout=connection_timeout)
+            log.info(f"Successfully connected to SQL Server: {self.server}/{self.database}")
         except Exception as e:
-            log.error(f"SQL Server connection test failed: {e}")
-            raise ConnectionError(f"Failed to connect to SQL Server: {e}")
+            log.error(f"Failed to connect to SQL Server: {e}")
+            raise ValueError(f"Failed to connect to SQL Server '{self.server}': {e}") from e
 
-    def _execute_query(self, query: str) -> pd.DataFrame:
-        """Execute a query and return results as DataFrame"""
+    # SQL Server types that may need special handling
+    _CX_SPATIAL_TYPES = {'geometry', 'geography'}  # use .STAsText()
+    _CX_OTHER_UNSUPPORTED = {'hierarchyid', 'xml', 'sql_variant', 'image', 'timestamp'}
+    _CX_UNSUPPORTED_TYPES = _CX_SPATIAL_TYPES | _CX_OTHER_UNSUPPORTED
+
+    def _safe_select_list(self, schema: str, table_name: str) -> str:
+        """Build a SELECT column list that converts unsupported types to text.
+        Uses .STAsText() for spatial types, CAST(... AS NVARCHAR(MAX)) for others.
+        Returns '*' if no unsupported columns are found."""
         try:
-            with pyodbc.connect(self.connection_string) as conn:
-                return pd.read_sql(query, conn)
+            columns_query = f"""
+                SELECT COLUMN_NAME, DATA_TYPE
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{table_name}'
+                ORDER BY ORDINAL_POSITION
+            """
+            cols_df = self._execute_query_raw(columns_query).to_pandas()
+            has_unsupported = any(r['DATA_TYPE'].lower() in self._CX_UNSUPPORTED_TYPES for _, r in cols_df.iterrows())
+            if not has_unsupported:
+                return "*"
+            parts = []
+            for _, r in cols_df.iterrows():
+                col, dtype = r['COLUMN_NAME'], r['DATA_TYPE'].lower()
+                if dtype in self._CX_SPATIAL_TYPES:
+                    parts.append(f"[{col}].STAsText() AS [{col}]")
+                elif dtype in self._CX_OTHER_UNSUPPORTED:
+                    parts.append(f"CAST([{col}] AS NVARCHAR(MAX)) AS [{col}]")
+                else:
+                    parts.append(f"[{col}]")
+            return ', '.join(parts)
+        except Exception:
+            return "*"
+
+    def _read_sql(self, query: str) -> pa.Table:
+        """Execute a query and return results as a PyArrow Table (no pandas)."""
+        cur = self._conn.cursor()
+        try:
+            cur.execute(query)
+            if cur.description is None:
+                return pa.table({})
+            columns = [desc[0] for desc in cur.description]
+            rows = cur.fetchall()
+            if not rows:
+                return pa.table({col: pa.array([], type=pa.null()) for col in columns})
+            col_data = {col: [row[i] for row in rows] for i, col in enumerate(columns)}
+            return pa.table(col_data)
+        finally:
+            cur.close()
+
+    def _execute_query_raw(self, query: str) -> pa.Table:
+        """Execute a query (no error wrapping)."""
+        return self._read_sql(query)
+
+    def _execute_query(self, query: str) -> pa.Table:
+        """Execute a query and return results as a PyArrow Table."""
+        try:
+            return self._read_sql(query)
         except Exception as e:
             log.error(f"Failed to execute query: {e}")
             raise
 
-    def list_tables(self):
-        """List all tables from SQL Server database"""
+    def fetch_data_as_arrow(
+        self,
+        source_table: str,
+        import_options: dict[str, Any] | None = None,
+    ) -> pa.Table:
+        """
+        Fetch data from SQL Server as a PyArrow Table.
+        """
+        opts = import_options or {}
+        size = min(opts.get("size", MAX_IMPORT_ROWS), MAX_IMPORT_ROWS)
+        sort_columns = opts.get("sort_columns")
+        sort_order = opts.get("sort_order", "asc")
+
+        if not source_table:
+            raise ValueError("source_table must be provided")
+        
+        # Parse table name
+        if "." in source_table:
+            schema, table = source_table.split(".", 1)
+        else:
+            schema = "dbo"
+            table = source_table
+        
+        col_list = self._safe_select_list(schema.strip('[]'), table.strip('[]'))
+        base_query = f"SELECT TOP {int(size)} {col_list} FROM [{schema}].[{table}]"
+        
+        # Add ORDER BY if sort columns specified
+        order_by_clause = ""
+        if sort_columns and len(sort_columns) > 0:
+            order_direction = "DESC" if sort_order == 'desc' else "ASC"
+            sanitized_cols = [f'[{col}] {order_direction}' for col in sort_columns]
+            order_by_clause = f" ORDER BY {', '.join(sanitized_cols)}"
+        
+        query = f"{base_query}{order_by_clause}"
+        
+        log.info(f"Executing SQL Server query: {query[:200]}...")
+        
+        arrow_table = self._execute_query(query)
+        log.info(f"Fetched {arrow_table.num_rows} rows from SQL Server")
+        
+        return arrow_table
+
+    def probe(self, path: list[str], query: dict[str, Any]) -> dict[str, Any]:
+        """Compile the SPJQ to T-SQL (TOP / bracket quoting) and run it."""
+        if not path:
+            return {"error": "probe requires a non-empty table path"}
+        src = ".".join(str(p) for p in path)
+        if "." in src:
+            schema, table = src.split(".", 1)
+        else:
+            schema, table = "dbo", src
+        dialect = probe_utils.MSSQL
         try:
-            # Query SQL Server system tables to get table information
+            relation = (
+                f"{probe_utils.quote_ident(schema.strip('[]'), dialect)}."
+                f"{probe_utils.quote_ident(table.strip('[]'), dialect)}"
+            )
+        except ValueError as exc:
+            return {"error": f"invalid table identifier: {exc}"}
+        return probe_utils.probe_via_native_sql(
+            query, relation=relation, dialect=dialect, execute=self._execute_query,
+        )
+
+    def list_tables(self, table_filter: str | None = None) -> list[dict[str, Any]]:
+        """List all tables and views from a SQL Server database.
+
+        Only queries INFORMATION_SCHEMA in batch; does NOT run per-table
+        SELECT TOP or COUNT(*) to keep catalog browsing fast.
+        """
+        try:
             tables_query = """
-                SELECT 
-                    TABLE_SCHEMA, 
-                    TABLE_NAME,
-                    TABLE_TYPE
+                SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
                 FROM INFORMATION_SCHEMA.TABLES 
-                WHERE TABLE_TYPE = 'BASE TABLE' 
-                AND TABLE_SCHEMA NOT IN ('sys', 'INFORMATION_SCHEMA')
+                WHERE TABLE_TYPE IN ('BASE TABLE', 'VIEW')
+                  AND TABLE_SCHEMA NOT IN ('sys', 'INFORMATION_SCHEMA')
                 ORDER BY TABLE_SCHEMA, TABLE_NAME
             """
+            tables_df = self._execute_query(tables_query).to_pandas()
 
-            tables_df = self._execute_query(tables_query)
+            columns_query = """
+                SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA NOT IN ('sys', 'INFORMATION_SCHEMA')
+                ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
+            """
+            cols_df = self._execute_query(columns_query).to_pandas()
+
+            col_map: dict[str, list[dict]] = {}
+            for _, cr in cols_df.iterrows():
+                key = f"{cr['TABLE_SCHEMA']}.{cr['TABLE_NAME']}"
+                col_map.setdefault(key, []).append({
+                    "name": cr["COLUMN_NAME"],
+                    "type": cr["DATA_TYPE"],
+                })
+
+            # Batch-fetch MS_Description for tables and columns
+            table_desc_map: dict[str, str] = {}
+            col_desc_map: dict[str, str] = {}
+            try:
+                table_desc_query = """
+                    SELECT s.name AS schema_name, t.name AS table_name,
+                           CAST(ep.value AS NVARCHAR(4000)) AS description
+                    FROM sys.tables t
+                    JOIN sys.schemas s ON t.schema_id = s.schema_id
+                    JOIN sys.extended_properties ep
+                      ON ep.major_id = t.object_id AND ep.minor_id = 0
+                         AND ep.name = 'MS_Description'
+                """
+                td_df = self._execute_query(table_desc_query).to_pandas()
+                for _, r in td_df.iterrows():
+                    desc = str(r["description"]).strip() if r["description"] else ""
+                    if desc:
+                        table_desc_map[f"{r['schema_name']}.{r['table_name']}"] = desc
+            except Exception:
+                pass
+
+            try:
+                col_desc_query = """
+                    SELECT s.name AS schema_name, t.name AS table_name,
+                           c.name AS column_name,
+                           CAST(ep.value AS NVARCHAR(4000)) AS description
+                    FROM sys.columns c
+                    JOIN sys.tables t ON c.object_id = t.object_id
+                    JOIN sys.schemas s ON t.schema_id = s.schema_id
+                    JOIN sys.extended_properties ep
+                      ON ep.major_id = c.object_id AND ep.minor_id = c.column_id
+                         AND ep.name = 'MS_Description'
+                """
+                cd_df = self._execute_query(col_desc_query).to_pandas()
+                for _, r in cd_df.iterrows():
+                    desc = str(r["description"]).strip() if r["description"] else ""
+                    if desc:
+                        col_desc_map[f"{r['schema_name']}.{r['table_name']}.{r['column_name']}"] = desc
+            except Exception:
+                pass
+
             results = []
-
             for _, row in tables_df.iterrows():
                 schema = row["TABLE_SCHEMA"]
                 table_name = row["TABLE_NAME"]
-                table_type = row.get("TABLE_TYPE", "BASE TABLE")
+                object_directory = "Views" if row["TABLE_TYPE"] == "VIEW" else "Tables"
                 full_table_name = f"{schema}.{table_name}"
 
-                try:
-                    # Get column information
-                    columns_query = f"""
-                        SELECT 
-                            COLUMN_NAME, 
-                            DATA_TYPE, 
-                            IS_NULLABLE, 
-                            COLUMN_DEFAULT,
-                            CHARACTER_MAXIMUM_LENGTH,
-                            NUMERIC_PRECISION,
-                            NUMERIC_SCALE
-                        FROM INFORMATION_SCHEMA.COLUMNS 
-                        WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{table_name}'
-                        ORDER BY ORDINAL_POSITION
-                    """
-                    columns_df = self._execute_query(columns_query)
+                if table_filter and table_filter.lower() not in full_table_name.lower():
+                    continue
 
-                    columns = []
-                    for _, col_row in columns_df.iterrows():
-                        col_info = {
-                            "name": col_row["COLUMN_NAME"],
-                            "type": col_row["DATA_TYPE"],
-                            "nullable": col_row["IS_NULLABLE"] == "YES",
-                            "default": col_row["COLUMN_DEFAULT"],
-                        }
+                columns = col_map.get(full_table_name, [])
+                for col_entry in columns:
+                    cd_key = f"{full_table_name}.{col_entry['name']}"
+                    if cd_key in col_desc_map:
+                        col_entry["description"] = col_desc_map[cd_key]
 
-                        # Add length/precision info for relevant types with NaN handling
-                        if (
-                            col_row["CHARACTER_MAXIMUM_LENGTH"] is not None
-                            and not pd.isna(col_row["CHARACTER_MAXIMUM_LENGTH"])
-                        ):
-                            try:
-                                col_info["max_length"] = int(col_row["CHARACTER_MAXIMUM_LENGTH"])
-                            except (ValueError, TypeError):
-                                pass  # Skip if conversion fails
+                metadata: dict[str, Any] = {
+                    "_source_name": full_table_name,
+                    "columns": columns,
+                }
+                if full_table_name in table_desc_map:
+                    metadata["description"] = table_desc_map[full_table_name]
 
-                        if (
-                            col_row["NUMERIC_PRECISION"] is not None
-                            and not pd.isna(col_row["NUMERIC_PRECISION"])
-                        ):
-                            try:
-                                col_info["precision"] = int(col_row["NUMERIC_PRECISION"])
-                            except (ValueError, TypeError):
-                                pass  # Skip if conversion fails
-
-                        if (
-                            col_row["NUMERIC_SCALE"] is not None
-                            and not pd.isna(col_row["NUMERIC_SCALE"])
-                        ):
-                            try:
-                                col_info["scale"] = int(col_row["NUMERIC_SCALE"])
-                            except (ValueError, TypeError):
-                                pass  # Skip if conversion fails
-
-                        columns.append(col_info)
-
-                    # Get sample data (first 10 rows)
-                    sample_query = f"SELECT TOP 10 * FROM [{schema}].[{table_name}]"
-                    sample_df = self._execute_query(sample_query)
-
-                    # Handle NaN values in sample data for JSON serialization
-                    try:
-                        # Replace NaN with None for proper JSON serialization
-                        sample_df_clean = sample_df.fillna(value=None)
-                        sample_rows = json.loads(
-                            sample_df_clean.to_json(
-                                orient="records", date_format="iso", default_handler=str
-                            )
-                        )
-                    except Exception as e:
-                        log.warning(
-                            f"Failed to serialize sample data for table {schema}.{table_name}: {e}"
-                        )
-                        sample_rows = []
-
-                    # Get row count
-                    count_query = f"SELECT COUNT(*) as row_count FROM [{schema}].[{table_name}]"
-                    count_df = self._execute_query(count_query)
-
-                    # Handle NaN values in row count
-                    raw_count = count_df.iloc[0]["row_count"]
-                    if pd.isna(raw_count):
-                        row_count = 0
-                        log.warning(
-                            f"Row count for table {schema}.{table_name} returned NaN, using 0"
-                        )
-                    else:
-                        try:
-                            row_count = int(raw_count)
-                        except (ValueError, TypeError):
-                            row_count = 0
-                            log.warning(
-                                f"Could not convert row count '{raw_count}' to integer for table {schema}.{table_name}, using 0"
-                            )
-
-                    table_metadata = {
-                        "row_count": row_count,
-                        "columns": columns,
-                        "sample_rows": sample_rows,
-                        "table_type": table_type,
-                    }
-
-                    results.append({"name": full_table_name, "metadata": table_metadata})
-
-                except Exception as e:
-                    log.warning(f"Failed to get metadata for table {full_table_name}: {e}")
-                    # Add table without detailed metadata
-                    results.append(
-                        {
-                            "name": full_table_name,
-                            "metadata": {
-                                "row_count": 0,
-                                "columns": [],
-                                "sample_rows": [],
-                                "table_type": table_type,
-                            },
-                        }
-                    )
+                results.append({
+                    "name": full_table_name,
+                    "path": [schema, object_directory, table_name],
+                    "metadata": metadata,
+                })
 
         except Exception as e:
             log.error(f"Failed to list tables from SQL Server: {e}")
@@ -387,79 +425,359 @@ SQL Server Connection Instructions:
 
         return results
 
-    def ingest_data(self, table_name: str, name_as: Optional[str] = None, size: int = 1000000, sort_columns: List[str] = None, sort_order: str = 'asc'):
-        """Ingest data from SQL Server table into DuckDB"""
-        # Parse table name (assuming format: schema.table)
-        if "." in table_name:
-            schema, table = table_name.split(".", 1)
-        else:
-            schema = "dbo"  # Default schema
-            table = table_name
+    # -- Cross-database sync -----------------------------------------------
 
-        if name_as is None:
-            name_as = table
+    def _list_tables_for_db(
+        self, db: str, table_filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List tables and views in a database using three-part naming.
 
-        name_as = sanitize_table_name(name_as)
+        Like ``list_tables`` but queries *[db].INFORMATION_SCHEMA* and
+        returns three-part ``database.schema.table`` identifiers.
+        """
+        tables_query = f"""
+                        SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
+            FROM [{db}].INFORMATION_SCHEMA.TABLES
+                        WHERE TABLE_TYPE IN ('BASE TABLE', 'VIEW')
+              AND TABLE_SCHEMA NOT IN ('sys', 'INFORMATION_SCHEMA')
+            ORDER BY TABLE_SCHEMA, TABLE_NAME
+        """
+        tables_df = self._execute_query(tables_query).to_pandas()
+        if tables_df.empty:
+            return []
+
+        columns_query = f"""
+            SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+            FROM [{db}].INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA NOT IN ('sys', 'INFORMATION_SCHEMA')
+            ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
+        """
+        cols_df = self._execute_query(columns_query).to_pandas()
+
+        col_map: dict[str, list[dict]] = {}
+        for _, cr in cols_df.iterrows():
+            key = f"{cr['TABLE_SCHEMA']}.{cr['TABLE_NAME']}"
+            col_map.setdefault(key, []).append({
+                "name": cr["COLUMN_NAME"],
+                "type": cr["DATA_TYPE"],
+            })
+
+        table_desc_map: dict[str, str] = {}
+        col_desc_map: dict[str, str] = {}
+        try:
+            table_desc_query = f"""
+                SELECT s.name AS schema_name, t.name AS table_name,
+                       CAST(ep.value AS NVARCHAR(4000)) AS description
+                FROM [{db}].sys.tables t
+                JOIN [{db}].sys.schemas s ON t.schema_id = s.schema_id
+                JOIN [{db}].sys.extended_properties ep
+                  ON ep.major_id = t.object_id AND ep.minor_id = 0
+                     AND ep.name = 'MS_Description'
+            """
+            td_df = self._execute_query(table_desc_query).to_pandas()
+            for _, r in td_df.iterrows():
+                desc = str(r["description"]).strip() if r["description"] else ""
+                if desc:
+                    table_desc_map[f"{r['schema_name']}.{r['table_name']}"] = desc
+        except Exception:
+            pass
 
         try:
-            # Build ORDER BY clause if sort_columns are specified
-            order_by_clause = ""
-            if sort_columns and len(sort_columns) > 0:
-                # Use square brackets for SQL Server column quoting
-                order_direction = "DESC" if sort_order == 'desc' else "ASC"
-                sanitized_cols = [f'[{col}] {order_direction}' for col in sort_columns]
-                order_by_clause = f"ORDER BY {', '.join(sanitized_cols)}"
+            col_desc_query = f"""
+                SELECT s.name AS schema_name, t.name AS table_name,
+                       c.name AS column_name,
+                       CAST(ep.value AS NVARCHAR(4000)) AS description
+                FROM [{db}].sys.columns c
+                JOIN [{db}].sys.tables t ON c.object_id = t.object_id
+                JOIN [{db}].sys.schemas s ON t.schema_id = s.schema_id
+                JOIN [{db}].sys.extended_properties ep
+                  ON ep.major_id = c.object_id AND ep.minor_id = c.column_id
+                     AND ep.name = 'MS_Description'
+            """
+            cd_df = self._execute_query(col_desc_query).to_pandas()
+            for _, r in cd_df.iterrows():
+                desc = str(r["description"]).strip() if r["description"] else ""
+                if desc:
+                    col_desc_map[f"{r['schema_name']}.{r['table_name']}.{r['column_name']}"] = desc
+        except Exception:
+            pass
 
-            # Query data from SQL Server with limit
-            query = f"SELECT TOP {size} * FROM [{schema}].[{table}] {order_by_clause}"
-            df = self._execute_query(query)
+        results: list[dict[str, Any]] = []
+        for _, row in tables_df.iterrows():
+            schema = row["TABLE_SCHEMA"]
+            table_name = row["TABLE_NAME"]
+            object_directory = "Views" if row["TABLE_TYPE"] == "VIEW" else "Tables"
+            schema_table = f"{schema}.{table_name}"
+            full_source = f"{db}.{schema}.{table_name}"
 
-            # Use the base class method to ingest DataFrame into DuckDB
-            self.ingest_df_to_duckdb(df, name_as)
-            log.info(f"Successfully ingested {len(df)} rows from {schema}.{table} to {name_as}")
-        except Exception as e:
-            log.error(f"Failed to ingest data from {table_name}: {e}")
-            raise
+            if table_filter and table_filter.lower() not in full_source.lower():
+                continue
 
-    def view_query_sample(self, query: str) -> List[Dict[str, Any]]:
-        """Execute a custom query and return sample results"""
+            columns = col_map.get(schema_table, [])
+            for col_entry in columns:
+                cd_key = f"{schema_table}.{col_entry['name']}"
+                if cd_key in col_desc_map:
+                    col_entry["description"] = col_desc_map[cd_key]
+
+            metadata: dict[str, Any] = {
+                "_source_name": full_source,
+                "columns": columns,
+            }
+            if schema_table in table_desc_map:
+                metadata["description"] = table_desc_map[schema_table]
+
+            results.append({
+                "name": full_source,
+                "path": [db, schema, object_directory, table_name],
+                "metadata": metadata,
+            })
+
+        return results
+
+    def sync_catalog_metadata(
+        self, table_filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Full metadata sync across all accessible databases.
+
+        When ``database`` is specified in connection params, behaves like
+        the base class (delegates to ``list_tables``).  When ``database``
+        is empty, iterates every online user database on the server.
+        """
+        if self.database:
+            tables = self.list_tables(table_filter)
+            self.ensure_table_keys(tables)
+            return tables
+
+        db_rows = self._execute_query("""
+            SELECT name FROM sys.databases
+            WHERE name NOT IN ('master', 'tempdb', 'model', 'msdb')
+              AND state_desc = 'ONLINE'
+            ORDER BY name
+        """).to_pandas()
+
+        all_tables: list[dict[str, Any]] = []
+        for _, r in db_rows.iterrows():
+            db = r["name"]
+            try:
+                all_tables.extend(self._list_tables_for_db(db, table_filter))
+            except Exception:
+                log.debug(
+                    "sync_catalog_metadata skipped database %s", db,
+                    exc_info=True,
+                )
+
+        log.info("sync_catalog_metadata found %d tables across all databases", len(all_tables))
+        self.ensure_table_keys(all_tables)
+        return all_tables
+
+    # -- Catalog tree API --------------------------------------------------
+
+    @staticmethod
+    def catalog_hierarchy() -> list[dict[str, str]]:
+        return [
+            {"key": "database", "label": "Database"},
+            {"key": "schema", "label": "Schema"},
+            {"key": "object_type", "label": "Object type"},
+            {"key": "table", "label": "Table"},
+        ]
+
+    def ls(self, path: list[str] | None = None, filter: str | None = None) -> list[CatalogNode]:
+        path = path or []
+        eff = self.effective_hierarchy()
+        if len(path) >= len(eff):
+            return []
+        level_key = eff[len(path)]["key"]
+
+        if level_key == "database":
+            query = """
+                SELECT name FROM sys.databases
+                WHERE name NOT IN ('master', 'tempdb', 'model', 'msdb')
+                  AND state_desc = 'ONLINE'
+                ORDER BY name
+            """
+            rows = self._execute_query(query).to_pandas()
+            nodes = []
+            for _, r in rows.iterrows():
+                name = r["name"]
+                if filter and filter.lower() not in name.lower():
+                    continue
+                nodes.append(CatalogNode(name=name, node_type="namespace", path=path + [name]))
+            return nodes
+
+        if level_key == "schema":
+            pinned = self.pinned_scope()
+            db = pinned.get("database") or (path[0] if path else None)
+            if not db:
+                return []
+            query = f"""
+                SELECT DISTINCT TABLE_SCHEMA
+                FROM [{db}].INFORMATION_SCHEMA.TABLES
+                WHERE TABLE_TYPE IN ('BASE TABLE', 'VIEW')
+                  AND TABLE_SCHEMA NOT IN ('sys', 'INFORMATION_SCHEMA')
+                ORDER BY TABLE_SCHEMA
+            """
+            rows = self._execute_query(query).to_pandas()
+            nodes = []
+            for _, r in rows.iterrows():
+                name = r["TABLE_SCHEMA"]
+                if filter and filter.lower() not in name.lower():
+                    continue
+                nodes.append(CatalogNode(name=name, node_type="namespace", path=path + [name]))
+            return nodes
+
+        if level_key == "object_type":
+            pinned = self.pinned_scope()
+            remaining = list(path)
+            db = pinned.get("database")
+            if not db:
+                if not remaining:
+                    return []
+                db = remaining.pop(0)
+            schema = pinned.get("schema")
+            if not schema:
+                if not remaining:
+                    return []
+                schema = remaining.pop(0)
+            query = f"""
+                SELECT DISTINCT TABLE_TYPE
+                FROM [{db}].INFORMATION_SCHEMA.TABLES
+                WHERE TABLE_TYPE IN ('BASE TABLE', 'VIEW')
+                  AND TABLE_SCHEMA = '{schema}'
+            """
+            rows = self._execute_query(query).to_pandas()
+            directories = {
+                "Views" if r["TABLE_TYPE"] == "VIEW" else "Tables"
+                for _, r in rows.iterrows()
+            }
+            return [
+                CatalogNode(name=name, node_type="namespace", path=path + [name])
+                for name in ("Tables", "Views")
+                if name in directories and (not filter or filter.lower() in name.lower())
+            ]
+
+        if level_key == "table":
+            pinned = self.pinned_scope()
+            remaining = list(path)
+            db = pinned.get("database")
+            if not db:
+                if not remaining:
+                    return []
+                db = remaining.pop(0)
+            schema = pinned.get("schema")
+            if not schema:
+                if not remaining:
+                    return []
+                schema = remaining.pop(0)
+            if not remaining:
+                return []
+            object_directory = remaining.pop(0)
+            table_type = "VIEW" if object_directory == "Views" else "BASE TABLE"
+            query = f"""
+                SELECT TABLE_NAME
+                FROM [{db}].INFORMATION_SCHEMA.TABLES
+                WHERE TABLE_TYPE = '{table_type}' AND TABLE_SCHEMA = '{schema}'
+                ORDER BY TABLE_NAME
+            """
+            rows = self._execute_query(query).to_pandas()
+            nodes = []
+            for _, r in rows.iterrows():
+                name = r["TABLE_NAME"]
+                if filter and filter.lower() not in name.lower():
+                    continue
+                full_source = f"{db}.{schema}.{name}"
+                nodes.append(CatalogNode(
+                    name=name, node_type="table", path=path + [name],
+                    metadata={"_source_name": full_source},
+                ))
+            return nodes
+
+        return []
+
+    def get_metadata(self, path: list[str]) -> dict[str, Any]:
+        if not path:
+            return {}
+        pinned = self.pinned_scope()
+        remaining = list(path)
+        db = pinned.get("database")
+        if not db:
+            if not remaining:
+                return {}
+            db = remaining.pop(0)
+        schema = pinned.get("schema")
+        if not schema:
+            if not remaining:
+                return {}
+            schema = remaining.pop(0)
+        if not remaining:
+            return {}
+        table_name = remaining[-1]
         try:
-            # Add TOP 10 if not already present for SELECT queries
-            modified_query = query.strip()
-            if (
-                modified_query.upper().startswith("SELECT")
-                and not modified_query.upper().startswith("SELECT TOP")
-                and "TOP " not in modified_query.upper()[:50]
-            ):  # Check first 50 chars
-                modified_query = modified_query.replace("SELECT", "SELECT TOP 10", 1)
+            cols_df = self._execute_query(f"""
+                SELECT COLUMN_NAME, DATA_TYPE
+                FROM [{db}].INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{table_name}'
+                ORDER BY ORDINAL_POSITION
+            """).to_pandas()
+            columns = [{"name": r["COLUMN_NAME"], "type": r["DATA_TYPE"]} for _, r in cols_df.iterrows()]
 
-            result, error_message = validate_sql_query(modified_query)
-            if not result:
-                raise ValueError(error_message)
-            
-            df = self._execute_query(modified_query)
+            # Column descriptions from MS_Description
+            try:
+                cd_df = self._execute_query(f"""
+                    SELECT c.name AS column_name,
+                           CAST(ep.value AS NVARCHAR(4000)) AS description
+                    FROM [{db}].sys.columns c
+                    JOIN [{db}].sys.tables t ON c.object_id = t.object_id
+                    JOIN [{db}].sys.schemas s ON t.schema_id = s.schema_id
+                    JOIN [{db}].sys.extended_properties ep
+                      ON ep.major_id = c.object_id AND ep.minor_id = c.column_id
+                         AND ep.name = 'MS_Description'
+                    WHERE s.name = '{schema}' AND t.name = '{table_name}'
+                """).to_pandas()
+                col_descs = {r["column_name"]: str(r["description"]).strip()
+                             for _, r in cd_df.iterrows() if r["description"]}
+                for col_entry in columns:
+                    if col_entry["name"] in col_descs:
+                        col_entry["description"] = col_descs[col_entry["name"]]
+            except Exception:
+                pass
 
-            # Handle NaN values for JSON serialization
-            df_clean = df.fillna(value=None)
-            return json.loads(
-                df_clean.head(10).to_json(orient="records", date_format="iso", default_handler=str)
-            )
+            # Table description
+            table_description = None
+            try:
+                td_df = self._execute_query(f"""
+                    SELECT CAST(ep.value AS NVARCHAR(4000)) AS description
+                    FROM [{db}].sys.tables t
+                    JOIN [{db}].sys.schemas s ON t.schema_id = s.schema_id
+                    JOIN [{db}].sys.extended_properties ep
+                      ON ep.major_id = t.object_id AND ep.minor_id = 0
+                         AND ep.name = 'MS_Description'
+                    WHERE s.name = '{schema}' AND t.name = '{table_name}'
+                """).to_pandas()
+                if not td_df.empty and td_df["description"].iloc[0]:
+                    table_description = str(td_df["description"].iloc[0]).strip() or None
+            except Exception:
+                pass
+
+            count_df = self._execute_query(
+                f"SELECT COUNT(*) AS cnt FROM [{db}].[{schema}].[{table_name}]"
+            ).to_pandas()
+            row_count = int(count_df["cnt"].iloc[0])
+            col_list = self._safe_select_list(schema, table_name)
+            sample_df = self._execute_query(
+                f"SELECT TOP 5 {col_list} FROM [{db}].[{schema}].[{table_name}]"
+            ).to_pandas()
+            sample_rows = df_to_safe_records(sample_df.fillna(value=None))
+            result: dict[str, Any] = {"row_count": row_count, "columns": columns, "sample_rows": sample_rows}
+            if table_description:
+                result["description"] = table_description
+            return result
         except Exception as e:
-            log.error(f"Failed to execute query sample: {e}")
-            raise
+            log.warning(f"get_metadata failed for {path}: {e}")
+            return {}
 
-    def ingest_data_from_query(self, query: str, name_as: str) -> pd.DataFrame:
-        """Execute a custom query and ingest results into DuckDB"""
+    def test_connection(self) -> bool:
         try:
-            result, error_message = validate_sql_query(query)
-            if not result:
-                raise ValueError(error_message)
-            
-            df = self._execute_query(query)
-            # Use the base class's method to ingest the DataFrame
-            self.ingest_df_to_duckdb(df, sanitize_table_name(name_as))
-            log.info(f"Successfully ingested {len(df)} rows from custom query to {name_as}")
-            return df
-        except Exception as e:
-            log.error(f"Failed to execute and ingest custom query: {e}")
-            raise
+            self._execute_query("SELECT 1 AS ok")
+            return True
+        except Exception:
+            return False

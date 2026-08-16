@@ -2,11 +2,15 @@
 # Licensed under the MIT License.
 
 import json
+from data_formulator.agent_config import reasoning_effort_for
 from data_formulator.agents.agent_utils import extract_json_objects
+from data_formulator.agents.agent_language import inject_language_instruction
 
 import logging
 
 logger = logging.getLogger(__name__)
+
+_AGENT_ID = "sort_data"
 
 
 SYSTEM_PROMPT = '''You are a data scientist to help user to sort data.
@@ -65,33 +69,39 @@ For example:
 
 class SortDataAgent(object):
 
-    def __init__(self, client):
+    def __init__(self, client, language_instruction: str = ""):
         self.client = client
+        self.language_instruction = language_instruction
 
     def run(self, name, values, n=1):
 
         input_obj = {
             'name': name,
-            'value': values
+            'values': values
         }
 
-        user_query = f"[INPUT]\n\n{json.dumps(input_obj)}\n\n[OUTPUT]"
+        user_query = f"[INPUT]\n\n{json.dumps(input_obj, ensure_ascii=False)}\n\n[OUTPUT]"
 
-        logger.info(user_query)
+        logger.debug(user_query)
+        logger.info(f"[SortDataAgent] run start")
 
-        messages = [{"role":"system", "content": SYSTEM_PROMPT},
+        system_prompt = inject_language_instruction(
+            SYSTEM_PROMPT, self.language_instruction,
+        )
+
+        messages = [{"role":"system", "content": system_prompt},
                     {"role":"user","content": user_query}]
         
         ###### the part that calls open_ai
-        response = self.client.get_completion(messages = messages)
+        response = self.client.get_completion(messages = messages, reasoning_effort=reasoning_effort_for(_AGENT_ID, self.client.model))
 
         #log = {'messages': messages, 'response': response.model_dump(mode='json')}
 
         candidates = []
         for choice in response.choices:
             
-            logger.info("\n=== Sort data agent ===>\n")
-            logger.info(choice.message.content + "\n")
+            logger.debug("\n=== Sort data agent ===>\n")
+            logger.debug(choice.message.content + "\n")
             
             json_blocks = extract_json_objects(choice.message.content + "\n")
             
@@ -101,8 +111,8 @@ class SortDataAgent(object):
                 try:
                     json_block = json.loads(choice.message.content + "\n")
                     result = {'status': 'ok', 'content': json_block}
-                except:
-                    result = {'status': 'other error', 'content': 'unable to extract VegaLite script from response'}
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    result = {'status': 'other error', 'content': 'unable to extract script from response', 'content_code': 'agent.unableExtractScript'}
             
             # individual dialog for the agent
             result['dialog'] = [*messages, {"role": choice.message.role, "content": choice.message.content}]
@@ -110,4 +120,6 @@ class SortDataAgent(object):
 
             candidates.append(result)
 
+        status = candidates[0].get('status', '?') if candidates else 'empty'
+        logger.info(f"[SortDataAgent] run done | status={status}")
         return candidates

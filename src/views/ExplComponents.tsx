@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 import React, { FC, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import {
     Box,
     Card,
@@ -13,6 +14,8 @@ import {
 } from '@mui/material';
 import { styled } from '@mui/material/styles';
 import { alpha } from '@mui/material/styles';
+import { borderColor, shadow, transition, radius } from '../app/tokens';
+import { textVar } from '../app/layout';
 import 'katex/dist/katex.min.css';
 import { InlineMath, BlockMath } from 'react-katex';
 
@@ -22,7 +25,7 @@ import InfoIcon from '@mui/icons-material/Info';
 // Helper function to render text with LaTeX math expressions
 const renderWithMath = (text: string) => {
 
-    const parts: Array<{ type: 'text' | 'inline' | 'block', content: string }> = [];
+    const parts: Array<{ type: 'text' | 'inline' | 'block' | 'code', content: string }> = [];
     let currentIndex = 0;
     let currentText = '';
     
@@ -89,6 +92,29 @@ const renderWithMath = (text: string) => {
                 currentIndex++;
             }
         }
+        // Check for inline code `...`
+        else if (text[currentIndex] === '`') {
+            // Find the closing backtick
+            let codeEnd = currentIndex + 1;
+            while (codeEnd < text.length && text[codeEnd] !== '`') {
+                codeEnd++;
+            }
+
+            if (codeEnd < text.length) {
+                // Found complete inline code span
+                if (currentText) {
+                    parts.push({ type: 'text', content: currentText });
+                    currentText = '';
+                }
+                const codeContent = text.slice(currentIndex + 1, codeEnd);
+                parts.push({ type: 'code', content: codeContent });
+                currentIndex = codeEnd + 1;
+            } else {
+                // No closing backtick found, treat as text
+                currentText += text[currentIndex];
+                currentIndex++;
+            }
+        }
         // Regular character
         else {
             currentText += text[currentIndex];
@@ -114,56 +140,86 @@ const renderWithMath = (text: string) => {
             } catch (error) {
                 return <span key={index}>{`\\[${part.content}\\]`}</span>;
             }
+        } else if (part.type === 'code') {
+            return (
+                <Box
+                    component="code"
+                    key={index}
+                    sx={{
+                        fontFamily: 'var(--df-font-mono)',
+                        fontSize: '0.92em',
+                        px: 0.5,
+                        py: 0.1,
+                        borderRadius: '4px',
+                        backgroundColor: (theme) => alpha(theme.palette.text.primary, 0.06),
+                        color: 'text.primary',
+                        // Allow long code spans (e.g. summed field lists) to wrap
+                        // instead of overflowing the card horizontally.
+                        whiteSpace: 'pre-wrap',
+                        overflowWrap: 'anywhere',
+                        wordBreak: 'break-word',
+                    }}
+                >
+                    {part.content}
+                </Box>
+            );
         } else {
             return <span key={index}>{part.content}</span>;
         }
     });
 };
 
-// Styled components for the concept explanation cards
-const ConceptExplanationCard = styled(Card, {
+// Styled components for the concept explanation entries.
+// Rendered as lightweight metadata rows (label + formula) rather than boxed
+// cards, so they read as inline annotations on the derived table.
+const ConceptExplanationCard = styled(Box, {
     shouldForwardProp: (prop) => prop !== 'secondary',
-})<{ secondary: boolean }>(({ theme, secondary}) => ({
-    minWidth: 360,  // Increased from 300
-    maxWidth: 480,  // Increased from 360
-    margin: '4px',
-
-    borderRadius: '6px',
-    border: `1px solid ${alpha(theme.palette.divider, 0.2)}`,
-    boxShadow: '0 1px 2px rgba(0,0,0,0.05)',
-    transition: 'all 0.2s ease-in-out',
-    backgroundColor: alpha(theme.palette.background.paper, 0.9),
-    '&:hover': {
-        boxShadow: '0 2px 6px rgba(0,0,0,0.1)',
-        borderColor: !secondary ? theme.palette.primary.light : theme.palette.secondary.light, 
-        transform: 'translateY(-1px)',
-    },
+})<{ secondary: boolean }>(() => ({
+    minWidth: 0,
+    padding: '2px 0',
 }));
 
 const ConceptName = styled(Typography, {
     shouldForwardProp: (prop) => prop !== 'secondary',
 })<{ secondary: boolean }>(({ theme, secondary }) => ({
-    fontSize: '12px',
+    fontSize: textVar.xs,
     fontWeight: 600,
-    color: secondary ? theme.palette.secondary.main : theme.palette.primary.main,
-    marginBottom: '3px',
+    color: secondary ? theme.palette.secondary.main : theme.palette.text.secondary,
+    marginBottom: '1px',
     display: 'flex',
     alignItems: 'center',
     gap: '4px',
+    fontFamily: 'var(--df-font-mono)',
+    letterSpacing: '0.01em',
 }));
 
 const ConceptExplanation = styled(Typography)(({ theme }) => ({
-    fontSize: '11px',
-    lineHeight: 1.4,
-    overflow: 'auto',
+    fontSize: textVar.xs,
+    lineHeight: 1.5,
+    minWidth: 0,
     color: theme.palette.text.primary,
-    fontStyle: 'italic',
     '& .katex': {
-        fontSize: '12px',
+        fontSize: textVar.xs,
         lineHeight: 1.2,
     },
+    // KaTeX block-math defaults to `overflow-x: auto` with vertical padding
+    // that reserves room for a scrollbar even when the formula fits.  Drop
+    // the bottom padding and only show the scrollbar if it's actually needed
+    // (and hide its track to keep the card clean).
     '& .katex-display': {
-        margin: '4px 0',
+        margin: '10px 0',
+        paddingBottom: 0,
+        overflowX: 'auto',
+        overflowY: 'hidden',
+        scrollbarWidth: 'none',
+        '&::-webkit-scrollbar': { display: 'none' },
+    },
+    // Block-displayed formulas (fractions, sums, roots) need more height and
+    // a slightly larger glyph size than inline math so stacked structure is
+    // legible — inline `\(...\)` stays compact at 11px above.
+    '& .katex-display > .katex': {
+        fontSize: textVar.xl,
+        lineHeight: 1.5,
     },
 }));
 
@@ -182,6 +238,7 @@ export const ConceptExplCards: FC<ConceptExplCardsProps> = ({
     concepts, 
     maxCards = 8 
 }) => {
+    const { t } = useTranslation();
     const [expanded, setExpanded] = useState(false);
 
     if (!concepts || concepts.length === 0) {
@@ -193,26 +250,28 @@ export const ConceptExplCards: FC<ConceptExplCardsProps> = ({
 
 
     return (
-        <Box sx={{ position: 'relative', display: 'flex', justifyContent: 'center' }}>
-            {/* Concepts Grid */}
-            <Box sx={{ 
-                    display: 'grid', 
-                    gridTemplateColumns: 'repeat(auto-fill, minmax(360px, 1fr))',  // Increased from 180px
-                    gap: 1,
-                    overflow: 'hidden',
+        <Box sx={{ position: 'relative', display: 'flex', flexDirection: 'column', width: '100%' }}>
+            {/* Formulas as a metadata list — one per row, separated by hairline
+                dividers so they read as annotations rather than boxed cards. */}
+            <Box sx={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    width: '100%',
+                    minWidth: 0,
+                    '& > *:not(:last-child)': {
+                        borderBottom: `1px solid ${alpha('#000', 0.06)}`,
+                    },
                 }}>
                     {displayConcepts.map((concept, index) => {
                         let secondary = concept.field == "Statistical Analysis";
                         return (
                         <ConceptExplanationCard key={`${concept.field}-${index}`} secondary={secondary}>
-                            <CardContent sx={{ padding: '6px !important' }}>
-                                <ConceptName secondary={secondary}>
-                                    {concept.field}
-                                </ConceptName>
-                                <ConceptExplanation>
-                                    {renderWithMath(concept.explanation)}
-                                </ConceptExplanation>
-                            </CardContent>
+                            <ConceptName secondary={secondary}>
+                                {concept.field.replace(/\\_/g, '_')}
+                            </ConceptName>
+                            <ConceptExplanation>
+                                {renderWithMath(concept.explanation)}
+                            </ConceptExplanation>
                         </ConceptExplanationCard>
                     )})}
                 </Box>
@@ -224,15 +283,14 @@ export const ConceptExplCards: FC<ConceptExplCardsProps> = ({
                         justifyContent: 'center', 
                         marginTop: 1,
                         paddingTop: 1,
-                        borderTop: '1px solid',
-                        borderColor: 'divider',
+                        borderTop: `1px solid ${borderColor.divider}`,
                     }}>
-                        <Tooltip title={expanded ? "Show fewer concepts" : "Show all concepts"}>
+                        <Tooltip title={expanded ? t('concepts.showFewer') : t('concepts.showAll')}>
                             <IconButton
                                 size="small"
                                 onClick={() => setExpanded(!expanded)}
                                 sx={{
-                                    fontSize: '10px',
+                                    fontSize: textVar.xxs,
                                     color: 'text.secondary',
                                     '&:hover': {
                                         backgroundColor: 'action.hover',
@@ -241,8 +299,8 @@ export const ConceptExplCards: FC<ConceptExplCardsProps> = ({
                             >
                                 <Typography variant="caption">
                                     {expanded 
-                                        ? `Show first ${maxCards} concepts` 
-                                        : `Show all ${concepts.length} concepts`
+                                        ? t('concepts.showFirstN', { count: maxCards })
+                                        : t('concepts.showAllN', { count: concepts.length })
                                     }
                                 </Typography>
                             </IconButton>
@@ -271,8 +329,7 @@ export const CodeExplanationCard: FC<{
     title: string;
     icon: React.ReactNode;
     children: React.ReactNode;
-    transformationIndicatorText: string;
-}> = ({ title, icon, children, transformationIndicatorText }) => (
+}> = ({ title, icon, children }) => (
     <Card 
         variant="outlined"
         sx={{
@@ -281,13 +338,12 @@ export const CodeExplanationCard: FC<{
             display: "flex", 
             flexGrow: 1, 
             margin: 0,
-            borderRadius: 2,
-            border: '1px solid',
-            borderColor: 'divider',
-            boxShadow: '0 1px 3px rgba(0,0,0,0.08)',
-            transition: 'all 0.2s ease-in-out',
+            borderRadius: radius.md,
+            border: `1px solid ${borderColor.divider}`,
+            boxShadow: shadow.sm,
+            transition: transition.normal,
             '&:hover': {
-                boxShadow: '0 2px 8px rgba(0,0,0,0.12)',
+                boxShadow: shadow.lg,
                 borderColor: 'primary.main',
             }
         }}
@@ -304,7 +360,7 @@ export const CodeExplanationCard: FC<{
         >
             <Typography 
                 sx={{ 
-                    fontSize: 14, 
+                    fontSize: textVar.lg, 
                     margin: 1.5,
                     fontWeight: 500,
                     color: 'text.primary',
@@ -316,7 +372,7 @@ export const CodeExplanationCard: FC<{
                 gutterBottom
             >
                 {icon}
-                {title} ({transformationIndicatorText})
+                {title}
             </Typography>
             <Box 
                 sx={{
@@ -326,8 +382,7 @@ export const CodeExplanationCard: FC<{
                     flex: 'auto', 
                     padding: 1.5, 
                     background: 'background.default',
-                    borderTop: '1px solid',
-                    borderColor: 'divider',
+                    borderTop: `1px solid ${borderColor.divider}`,
                     borderRadius: '0 0 8px 8px'
                 }}
             >

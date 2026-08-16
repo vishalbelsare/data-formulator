@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 import * as React from 'react';
+import { useTranslation } from 'react-i18next';
+import { shadow, transition } from '../app/tokens';
 import { TableVirtuoso } from 'react-virtuoso';
 import Table from '@mui/material/Table';
 import TableBody from '@mui/material/TableBody';
@@ -20,23 +22,29 @@ import { getIconFromType } from './ViewUtils';
 import { IconButton, TableSortLabel, Typography } from '@mui/material';
 
 import _ from 'lodash';
+import * as d3 from 'd3-dsv';
 import { FieldSource, FieldItem } from '../components/ComponentType';
 
 import FileDownloadIcon from '@mui/icons-material/FileDownload';
-import CloudQueueIcon from '@mui/icons-material/CloudQueue';
+import { TableIcon } from '../icons';
 import CasinoIcon from '@mui/icons-material/Casino';
 import ArrowUpwardIcon from '@mui/icons-material/ArrowUpward';
 import ArrowDownwardIcon from '@mui/icons-material/ArrowDownward';
-import UnfoldMoreIcon from '@mui/icons-material/UnfoldMore';
-import { getUrls } from '../app/utils';
+import MoreVertIcon from '@mui/icons-material/MoreVert';
+import FilterAltIcon from '@mui/icons-material/FilterAlt';
+import { getUrls, fetchWithIdentity } from '../app/utils';
+import { apiRequest, assertDownloadResponseOk } from '../app/apiClient';
 import { useDrag } from 'react-dnd';
 import { useSelector } from 'react-redux';
-import { DataFormulatorState } from '../app/dfSlice';
+import { DataFormulatorState, dfSelectors } from '../app/dfSlice';
+import { ColumnFilter, ColumnFilterPopover } from './ColumnFilterPopover';
+import { iconVar, textVar } from '../app/layout';
 
 export interface ColumnDef {
     id: string;
     label: string;
     dataType: Type;
+    description?: string;
     minWidth?: number;
     width?: number;
     align?: 'right';
@@ -51,7 +59,22 @@ interface SelectableDataGridProps {
     rowCount: number;
     virtual: boolean;
     columnDefs: ColumnDef[];
+    // Controlled quick-search text (owned by the focused-table canvas). Filters
+    // the loaded rows client-side across all data columns.
+    searchText?: string;
+    // Hide the in-grid footer widget (row count / random / download). The
+    // focused-table canvas surfaces these actions in its bottom toolbar.
+    hideFooter?: boolean;
+    // Bumping this number triggers a "random rows" refetch (virtual tables).
+    randomizeToken?: number;
+    // Bumping this number restores the natural (#rowId head) order after a
+    // random sample (virtual tables).
+    resetOrderToken?: number;
+    // Report virtual-pagination state up so an external toolbar can render the
+    // loaded/total count and enable the random-rows action.
+    onStateReport?: (s: { loadedCount: number; rowCount: number; virtual: boolean; canRandomize: boolean; isRandom: boolean }) => void;
 }
+
 
 function descendingComparator<T>(a: T, b: T, orderBy: keyof T) {
     if (b[orderBy] < a[orderBy]) {
@@ -82,8 +105,6 @@ function getColorForFieldSource(source: string | undefined, theme: any): string 
     }
     
     switch (source) {
-        case "derived":
-            return theme.palette.derived.main; // Yellow/gold for derived fields
         case "custom":
             return theme.palette.custom.main; // Orange for custom fields
         case "original":
@@ -97,15 +118,33 @@ interface DraggableHeaderProps {
     columnDef: ColumnDef;
     orderBy: string | undefined;
     order: 'asc' | 'desc';
-    onSortClick: () => void;
+    onSortAsc: () => void;
+    onSortDesc: () => void;
+    onClearSort: () => void;
+    onOpenFilter: (anchor: HTMLElement) => void;
+    hasFilter: boolean;
     tableId: string;
 }
 
 const DraggableHeader: React.FC<DraggableHeaderProps> = ({ 
-    columnDef, orderBy, order, onSortClick, tableId 
+    columnDef, orderBy, order, onSortAsc, onSortDesc, onClearSort,
+    onOpenFilter, hasFilter, tableId
 }) => {
+    const { t } = useTranslation();
+    const filterButtonRef = React.useRef<HTMLButtonElement | null>(null);
+    const kebabButtonRef = React.useRef<HTMLButtonElement | null>(null);
+    const isSorted = orderBy === columnDef.id;
+    const cycleSort = () => {
+        if (!isSorted) { onSortAsc(); return; }
+        if (order === 'asc') { onSortDesc(); return; }
+        onClearSort();
+    };
     const theme = useTheme();
     const conceptShelfItems = useSelector((state: DataFormulatorState) => state.conceptShelfItems);
+    const semanticType = useSelector(
+        (state: DataFormulatorState) =>
+            state.tableSemantics.find(info => info.tableId === tableId)?.fields[columnDef.id]?.semanticType,
+    );
     
     // Find the corresponding FieldItem for this column
     // Try to find by name first, then by constructing the ID for original fields
@@ -128,13 +167,13 @@ const DraggableHeader: React.FC<DraggableHeaderProps> = ({
         }),
     }), [field]);
 
-    let backgroundColor = "white";
+    let backgroundColor: string;
     let borderBottomColor = theme.palette.primary.main;
     if (columnDef.source == "custom") {
-        backgroundColor = alpha(theme.palette.custom.main, 0.05);
+        backgroundColor = theme.palette.custom.bgcolor || alpha(theme.palette.custom.main, 0.1);
         borderBottomColor = theme.palette.custom.main;
     } else {
-        backgroundColor = alpha(theme.palette.primary.main, 0.05);
+        backgroundColor = theme.palette.primary.bgcolor || alpha(theme.palette.primary.main, 0.1);
         borderBottomColor = theme.palette.primary.main;
     }
 
@@ -145,28 +184,17 @@ const DraggableHeader: React.FC<DraggableHeaderProps> = ({
     const hoverBackgroundColor = field 
         ? alpha(getColorForFieldSource(field.source, theme), 0.1)
         : backgroundColor;
-    
-    // Determine sort icon
-    const getSortIcon = () => {
-        if (orderBy !== columnDef.id) {
-            return <UnfoldMoreIcon sx={{ fontSize: 16 }} />;
-        }
-        return order === 'asc' 
-            ? <ArrowUpwardIcon sx={{ fontSize: 16 }} />
-            : <ArrowDownwardIcon sx={{ fontSize: 16 }} />;
-    };
 
     return (
         <Box 
             className="data-view-header-container" 
-            ref={field ? dragSource : dragPreview}
+            ref={dragPreview}
             sx={{ 
                 backgroundColor: backgroundColor, 
                 borderBottomColor, 
                 borderBottomWidth: '2px', 
                 borderBottomStyle: 'solid',
                 opacity,
-                cursor: cursorStyle,
                 display: 'flex',
                 alignItems: 'center',
                 position: 'relative',
@@ -178,13 +206,14 @@ const DraggableHeader: React.FC<DraggableHeaderProps> = ({
                 ...(field && {
                     '&:hover': {
                         backgroundColor: hoverBackgroundColor,
-                        boxShadow: '0 2px 4px rgba(0,0,0,0.08)',
+                        boxShadow: shadow.md,
                     },
                 }),
             }}
         >
             {/* Main content area - draggable for concepts, using original TableSortLabel structure */}
             <TableSortLabel
+                ref={field ? dragSource : undefined}
                 className="data-view-header-title"
                 sx={{ 
                     display: "flex", 
@@ -196,129 +225,407 @@ const DraggableHeader: React.FC<DraggableHeaderProps> = ({
                         display: 'none',
                     },
                 }}
-                active={orderBy === columnDef.id}
-                direction={orderBy === columnDef.id ? order : 'asc'}
+                active={isSorted}
+                direction={isSorted ? order : 'asc'}
                 onClick={(e) => {
                     // Prevent sort when dragging
                     if (!isDragging) {
                         e.stopPropagation();
-                        onSortClick();
+                        cycleSort();
                     }
                 }}
             >
                 <span role="img" style={{ fontSize: "inherit", padding: "2px", display: "inline-flex", alignItems: "center" }}>
                     {getIconFromType(columnDef.dataType)}
                 </span>
-                <Typography sx={{fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
-                    {columnDef.label}
-                </Typography>
+                <Tooltip 
+                    title={(semanticType || columnDef.description) ? (
+                        <Box>
+                            {semanticType && (
+                                <Typography sx={{ fontSize: textVar.xs }}>
+                                    <b>{columnDef.label}</b>: <i>{semanticType}</i>
+                                </Typography>
+                            )}
+                            {columnDef.description && (
+                                <Typography sx={{ fontSize: textVar.xs, color: 'grey.300', mt: semanticType ? 0.25 : 0 }}>
+                                    {columnDef.description}
+                                </Typography>
+                            )}
+                        </Box>
+                    ) : ''}
+                    arrow
+                    placement="top"
+                >
+                    <Typography sx={{fontSize: textVar.sm, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
+                        {columnDef.label}
+                    </Typography>
+                </Tooltip>
+                {isSorted && (
+                    <Box component="span" sx={{ display: 'inline-flex', alignItems: 'center', ml: 0.25, color: theme.palette.primary.main }}>
+                        {order === 'asc'
+                            ? <ArrowUpwardIcon sx={{ fontSize: iconVar.sm }} />
+                            : <ArrowDownwardIcon sx={{ fontSize: iconVar.sm }} />}
+                    </Box>
+                )}
             </TableSortLabel>
-            {/* Separate sort handler button */}
-            <Tooltip title={<Typography sx={{fontSize: 10}}>Sort by <b>{columnDef.label}</b></Typography>}>
+            {/* Inline filter status hint \u2014 only rendered when a filter is active on this column.
+                Clicking reopens the filter popover. */}
+            {hasFilter && (
+                <Tooltip title={<Typography sx={{fontSize: textVar.xxs}}>{t('dataGrid.columnMenu.filterActive')}</Typography>}>
+                    <IconButton
+                        ref={filterButtonRef}
+                        size="small"
+                        onClick={(e) => {
+                            e.stopPropagation();
+                            onOpenFilter(e.currentTarget);
+                        }}
+                        sx={{
+                            padding: '2px',
+                            marginLeft: '2px',
+                            color: theme.palette.primary.main,
+                            '&:hover': {
+                                backgroundColor: alpha(theme.palette.action.hover, 0.2),
+                            },
+                        }}
+                    >
+                        <FilterAltIcon sx={{ fontSize: iconVar.sm }} />
+                    </IconButton>
+                </Tooltip>
+            )}
+            {/* Column kebab — single entry point that opens the unified
+                sort + filter popover (design-doc 31 §4.2). */}
+            <Tooltip title={<Typography sx={{fontSize: textVar.xxs}}>{t('dataGrid.columnMenu.openMenu')}</Typography>}>
                 <IconButton
+                    ref={kebabButtonRef}
                     size="small"
                     onClick={(e) => {
                         e.stopPropagation();
-                        onSortClick();
+                        onOpenFilter(e.currentTarget);
                     }}
                     sx={{
                         padding: '2px',
-                        marginLeft: '4px',
+                        marginLeft: '1px',
                         marginRight: '2px',
-                        opacity: orderBy === columnDef.id ? 1 : 0.5,
+                        color: alpha(theme.palette.text.primary, 0.55),
                         '&:hover': {
-                            opacity: 1,
+                            color: theme.palette.text.primary,
                             backgroundColor: alpha(theme.palette.action.hover, 0.2),
                         },
                     }}
                 >
-                    {getSortIcon()}
+                    <MoreVertIcon sx={{ fontSize: iconVar.md }} />
                 </IconButton>
             </Tooltip>
         </Box>
     );
 };
 
-export const SelectableDataGrid: React.FC<SelectableDataGridProps> = ({ 
-    tableId, rows, tableName, columnDefs, rowCount, virtual }) => {
+// Stable TableVirtuoso sub-components — defined once outside the render cycle
+// so react-virtuoso never sees new component references on re-render.
+const VirtuosoScroller = React.forwardRef<HTMLDivElement>((props, ref) => (
+    <TableContainer {...props} ref={ref} />
+));
+const VirtuosoTableHead = React.forwardRef<HTMLTableSectionElement, React.HTMLAttributes<HTMLTableSectionElement>>((props, ref) => (
+    <TableHead {...props} ref={ref} className='table-header-container' style={{ ...props.style, display: 'table-header-group' }} />
+));
+const VirtuosoTableRow = (props: any) => {
+    const index = props['data-index'];
+    return <TableRow {...props} style={{...props.style, backgroundColor: index % 2 == 0 ? "rgba(255, 255, 255, 0.05)" : "rgba(0, 0, 0, 0.02)"}}/>
+};
+const VirtuosoTableBody = React.forwardRef<HTMLTableSectionElement>((props, ref) => (
+    <TableBody {...props} ref={ref} />
+));
 
+const PAGE_SIZE = 500;
+
+export const SelectableDataGrid: React.FC<SelectableDataGridProps> = React.memo(({ 
+    tableId, rows, tableName, columnDefs, rowCount, virtual, searchText, hideFooter, randomizeToken, resetOrderToken, onStateReport }) => {
+
+    const { t } = useTranslation();
     const [orderBy, setOrderBy] = React.useState<string | undefined>(undefined);
     const [order, setOrder] = React.useState<'asc' | 'desc'>('asc');
+
+    // Column filter state — keyed by column id. Presence of an entry means
+    // the column has an active filter (design-doc 31). Server-side pushdown
+    // is handled by fetchVirtualData; non-virtual tables ignore filters in v1.
+    const [columnFilters, setColumnFilters] = React.useState<Record<string, ColumnFilter>>({});
+    const [filterPopover, setFilterPopover] = React.useState<{ columnId: string; anchor: HTMLElement } | null>(null);
+
+    // Lookup of per-column metadata (distinctCount/nullCount/levels/levelCounts/type)
+    // to drive the filter popover's variant selection synchronously.
+    const tableMetadata = useSelector(
+        (state: DataFormulatorState) => dfSelectors.getAllTables(state).find(t => t.id === tableId)?.metadata,
+    );
+
+    // Ref-based bridge to fetchVirtualData (declared further below); lets stable
+    // sort handlers call into the latest fetch function without re-creating themselves.
+    const fetchVirtualDataRef = React.useRef<((sortByColumnIds: string[], sortOrder: 'asc' | 'desc', offset?: number, append?: boolean, random?: boolean) => void) | null>(null);
+
+    const applySort = React.useCallback((newOrderBy: string | undefined, newOrder: 'asc' | 'desc') => {
+        setOrder(newOrder);
+        setOrderBy(newOrderBy);
+        setIsRandom(false);
+        if (virtual) {
+            fetchVirtualDataRef.current?.(newOrderBy ? [newOrderBy] : [], newOrder);
+        }
+    }, [virtual]);
 
     let theme = useTheme();
 
     const [rowsToDisplay, setRowsToDisplay] = React.useState<any[]>(rows);
-    
-    // Initialize as true to cover the initial mount delay
+    // True while the grid is showing a random sample (virtual tables). Lets the
+    // external toolbar offer a "restore order" action alongside the dice.
+    const [isRandom, setIsRandom] = React.useState<boolean>(false);
     const [isLoading, setIsLoading] = React.useState<boolean>(true);
+    const [isLoadingMore, setIsLoadingMore] = React.useState<boolean>(false);
+    const [isDownloading, setIsDownloading] = React.useState<boolean>(false);
+    const [hasMore, setHasMore] = React.useState<boolean>(virtual ? rows.length < rowCount : false);
+    // Filtered total reported by the server (reflects active search/filters for
+    // virtual tables). Falls back to the unfiltered prop count.
+    const [serverRowCount, setServerRowCount] = React.useState<number>(rowCount);
+    const fetchIdRef = React.useRef(0);
     
-    // Clear loading state after first render
     React.useEffect(() => {
         setIsLoading(false);
     }, []);
 
     React.useEffect(() => {
-        if (orderBy && !isLoading) {
+        if (orderBy && !isLoading && !virtual) {
             setRowsToDisplay(rows.slice().sort(getComparator(order, orderBy)));
-        } else {
+        } else if (!virtual) {
             setRowsToDisplay(rows);
+        }
+        if (!virtual) {
+            setHasMore(false);
         }
     }, [rows, order, orderBy])
 
-    const TableComponents = {
-        Scroller: React.forwardRef<HTMLDivElement>((props, ref) => (
-            <TableContainer {...props} ref={ref} />
-        )),
-        Table: (props: any) => <Table {...props} />,
-        TableHead: React.forwardRef<HTMLTableSectionElement>((props, ref) => (
-            <TableHead {...props} ref={ref} className='table-header-container' />
-        )),
-        TableRow: (props: any) => {
-            const index = props['data-index'];
-            return <TableRow {...props} style={{backgroundColor: index % 2 == 0 ? "rgba(255, 255, 255, 0.05)" : "rgba(0, 0, 0, 0.02)"}}/>
-        },
-        TableBody: React.forwardRef<HTMLTableSectionElement>((props, ref) => (
-            <TableBody {...props} ref={ref} />
-        )),
-    }
+    // Report virtual-pagination state up to an external toolbar (focused-table
+    // canvas) so it can render the loaded/total count and the random-rows dice.
+    React.useEffect(() => {
+        const effectiveCount = virtual ? serverRowCount : rowCount;
+        onStateReport?.({
+            loadedCount: rowsToDisplay.length,
+            rowCount: effectiveCount,
+            virtual,
+            canRandomize: virtual && effectiveCount > 10000,
+            isRandom: virtual && isRandom,
+        });
+    }, [rowsToDisplay.length, rowCount, serverRowCount, virtual, isRandom, onStateReport]);
 
-    const fetchVirtualData = (sortByColumnIds: string[], sortOrder: 'asc' | 'desc') => {
-        // Set loading to true when starting the fetch
-        setIsLoading(true);
+    // Bumping `randomizeToken` (from the external toolbar's dice) resets sort
+    // and refetches a fresh random sample (ORDER BY RANDOM() on the server,
+    // which also respects any active filters/search) for virtual tables.
+    const randomizeMountRef = React.useRef(true);
+    React.useEffect(() => {
+        if (randomizeMountRef.current) { randomizeMountRef.current = false; return; }
+        if (!virtual) return;
+        setOrderBy(undefined);
+        setOrder('asc');
+        setIsRandom(true);
+        fetchVirtualDataRef.current?.([], 'asc', 0, false, true);
+    }, [randomizeToken]);
 
-        let message = sortByColumnIds.length > 0 ? {
-            table: tableId,
-            size: 1000,
-            method: sortOrder === 'asc' ? 'head' : 'bottom',
-            order_by_fields: sortByColumnIds
-        } : {
-            table: tableId,
-            size: 1000,
-            method: 'random'
+    // Bumping `resetOrderToken` (from the toolbar's "restore order" button)
+    // returns a randomized virtual table to its natural #rowId head order.
+    const resetOrderMountRef = React.useRef(true);
+    React.useEffect(() => {
+        if (resetOrderMountRef.current) { resetOrderMountRef.current = false; return; }
+        if (!virtual) return;
+        setOrderBy(undefined);
+        setOrder('asc');
+        setIsRandom(false);
+        fetchVirtualDataRef.current?.([], 'asc', 0, false, false);
+    }, [resetOrderToken]);
+
+    // Only the Table component depends on columnDefs (for colgroup); memoize it
+    // so react-virtuoso keeps a stable reference when columns haven't changed.
+    const columnIds = columnDefs.map(c => c.id).join(',');
+    const VirtuosoTable = React.useMemo(() => {
+        const Comp = ({ children, style, ...rest }: any) => (
+            <Table {...rest} style={style} sx={{ tableLayout: 'fixed', width: '100%' }}>
+                <colgroup>
+                    {columnDefs.map(col => (
+                        <col key={col.id} style={col.id === '#rowId' ? { width: 56 } : undefined} />
+                    ))}
+                </colgroup>
+                {children}
+            </Table>
+        );
+        return Comp;
+    }, [columnIds]);
+
+    const tableComponents = React.useMemo(() => ({
+        Scroller: VirtuosoScroller,
+        Table: VirtuosoTable,
+        TableHead: VirtuosoTableHead,
+        TableRow: VirtuosoTableRow,
+        TableBody: VirtuosoTableBody,
+    }), [VirtuosoTable]);
+
+    const handleDownload = async (format: 'csv' | 'tsv') => {
+        if (isDownloading) return;
+        const delimiter = format === 'tsv' ? '\t' : ',';
+        const ext = format === 'tsv' ? 'tsv' : 'csv';
+        const mime = format === 'tsv' ? 'text/tab-separated-values' : 'text/csv';
+
+        setIsDownloading(true);
+        try {
+            if (virtual) {
+                const response = await fetchWithIdentity(getUrls().EXPORT_TABLE_CSV, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ table_name: tableId, delimiter }),
+                });
+                await assertDownloadResponseOk(response, 'Export failed');
+                const blob = await response.blob();
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = `${tableName}.${ext}`;
+                a.click();
+                URL.revokeObjectURL(a.href);
+            } else {
+                const csvContent = d3.dsvFormat(delimiter).format(rows);
+                const blob = new Blob([csvContent], { type: mime });
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = `${tableName}.${ext}`;
+                a.click();
+                URL.revokeObjectURL(a.href);
+            }
+        } catch (error) {
+            console.error('Error downloading table:', error);
+        } finally {
+            setIsDownloading(false);
         }
-        
-        // Use the SAMPLE_TABLE endpoint with appropriate ordering
-        fetch(getUrls().SAMPLE_TABLE, {
+    };
+
+    // Hold the live filters in a ref so fetchVirtualData stays stable yet
+    // always reads the latest set when called from sort/scroll handlers.
+    const filtersRef = React.useRef<ColumnFilter[]>([]);
+    React.useEffect(() => {
+        filtersRef.current = Object.values(columnFilters);
+    }, [columnFilters]);
+
+    // Committed global search term (server-side pushdown for virtual tables).
+    // Held in a ref so fetchVirtualData stays stable across sort/scroll while
+    // still carrying the latest search into every request.
+    const searchRef = React.useRef<string>('');
+    React.useEffect(() => {
+        searchRef.current = (searchText || '').trim();
+    }, [searchText]);
+
+    const fetchVirtualData = React.useCallback((
+        sortByColumnIds: string[],
+        sortOrder: 'asc' | 'desc',
+        offset: number = 0,
+        append: boolean = false,
+        random: boolean = false,
+    ) => {
+        if (!append) {
+            setIsLoading(true);
+        } else {
+            setIsLoadingMore(true);
+        }
+
+        const currentFetchId = ++fetchIdRef.current;
+
+        const activeFilters = filtersRef.current;
+        const message: Record<string, any> = {
+            table: tableId,
+            size: PAGE_SIZE,
+            offset,
+            method: random
+                ? 'random'
+                : (sortByColumnIds.length > 0
+                    ? (sortOrder === 'asc' ? 'head' : 'bottom')
+                    : 'head'),
+            order_by_fields: sortByColumnIds.length > 0 ? sortByColumnIds : ['#rowId'],
+            ...(activeFilters.length > 0 ? { filters: activeFilters } : {}),
+            ...(searchRef.current ? { search: searchRef.current } : {}),
+        };
+
+        apiRequest<any>(getUrls().SAMPLE_TABLE, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(message),
         })
-        .then(response => response.json())
-        .then(data => {
-            if (data.status === 'success') {
-                setRowsToDisplay(data.rows);
+        .then(({ data }) => {
+            if (fetchIdRef.current !== currentFetchId) return;
+            const newRows = data.rows || [];
+            const totalCount = data.total_row_count ?? rowCount;
+
+            if (append) {
+                setRowsToDisplay(prev => [...prev, ...newRows]);
+            } else {
+                setRowsToDisplay(newRows);
             }
-            // Set loading to false when done
+            setServerRowCount(totalCount);
+            setHasMore(!random && offset + newRows.length < totalCount);
             setIsLoading(false);
+            setIsLoadingMore(false);
         })
         .catch(error => {
+            if (fetchIdRef.current !== currentFetchId) return;
             console.error('Error fetching sorted table data:', error);
-            // Ensure loading is set to false even on error
             setIsLoading(false);
+            setIsLoadingMore(false);
         });
-    };
+    }, [tableId, rowCount]);
+
+    // Keep the ref in sync so stable handlers (e.g. applySort) can call the latest version.
+    React.useEffect(() => {
+        fetchVirtualDataRef.current = fetchVirtualData;
+    }, [fetchVirtualData]);
+
+    // Refetch from offset 0 whenever filters change (virtual tables only).
+    // Skip the initial mount; the first load happens via the existing
+    // virtual-data effect.
+    const didMountFiltersRef = React.useRef(false);
+    React.useEffect(() => {
+        if (!virtual) return;
+        if (!didMountFiltersRef.current) {
+            didMountFiltersRef.current = true;
+            return;
+        }
+        setIsRandom(false);
+        fetchVirtualData(orderBy ? [orderBy] : [], order, 0, false);
+         
+    }, [columnFilters]);
+
+    // Refetch from offset 0 whenever the committed search term changes
+    // (virtual tables only). Non-virtual tables filter client-side below.
+    const didMountSearchRef = React.useRef(false);
+    React.useEffect(() => {
+        if (!virtual) return;
+        if (!didMountSearchRef.current) {
+            didMountSearchRef.current = true;
+            return;
+        }
+        searchRef.current = (searchText || '').trim();
+        setIsRandom(false);
+        fetchVirtualData(orderBy ? [orderBy] : [], order, 0, false);
+         
+    }, [searchText]);
+
+    const handleEndReached = React.useCallback(() => {
+        if (!virtual || !hasMore || isLoadingMore || isLoading) return;
+        fetchVirtualData(
+            orderBy ? [orderBy] : [],
+            order,
+            rowsToDisplay.length,
+            true,
+        );
+    }, [virtual, hasMore, isLoadingMore, isLoading, fetchVirtualData, orderBy, order, rowsToDisplay.length]);
+
+    // Virtual tables are already filtered server-side (search pushdown), so we
+    // render their rows as-is. Non-virtual tables (fully loaded) filter
+    // client-side over the committed search term — case-insensitive substring.
+    const trimmedSearch = (searchText || '').trim().toLowerCase();
+    const visibleRows = (!virtual && trimmedSearch)
+        ? rowsToDisplay.filter(row =>
+            columnDefs.some(c => c.id !== '#rowId' && String(row[c.id] ?? '').toLowerCase().includes(trimmedSearch)))
+        : rowsToDisplay;
 
     return (
         <Box className="table-container table-container-small"
@@ -327,7 +634,7 @@ export const SelectableDataGrid: React.FC<SelectableDataGridProps> = ({
                 height: '100%',
                 position: 'relative',
                 "& .MuiTableCell-root": {
-                    fontSize: 12, maxWidth: "120px", py: '2px', cursor: "default",
+                    fontSize: textVar.sm, maxWidth: "120px", py: '2px', cursor: "default",
                     overflow: "clip", textOverflow: "ellipsis", whiteSpace: "nowrap"
                 }
             }}>
@@ -349,15 +656,17 @@ export const SelectableDataGrid: React.FC<SelectableDataGridProps> = ({
                     borderTopRightRadius: '4px'
                 }}>
                     <CircularProgress size={24} sx={{ mr: 1, color: 'lightgray' }} />
-                    <Typography variant="body2" color="text.secondary">Loading ...</Typography>
+                    <Typography variant="body2" color="text.secondary">{t('dataGrid.loading')}</Typography>
                 </Box>
             )}
             <Fade in={!isLoading} timeout={{appear: 300, enter: 300, exit: 2000}}>
                 <Box sx={{ flex: '1 1', display: 'flex', flexDirection: 'column' }}>
                     <TableVirtuoso
-                            style={{ flex: '1 1' }}
-                            data={rowsToDisplay}
-                            components={TableComponents}
+                            style={{ flex: '1 1', paddingBottom: 32 }}
+                            data={visibleRows}
+                            components={tableComponents}
+                            endReached={handleEndReached}
+                            overscan={200}
                             fixedHeaderContent={() => {
                         return (
                             <TableRow key='header-fixed' style={{ paddingRight: 0, marginRight: '17px', height: '24px'}}>
@@ -367,33 +676,49 @@ export const SelectableDataGrid: React.FC<SelectableDataGridProps> = ({
                                             className='data-view-header-cell'
                                             key={columnDef.id}
                                             align={columnDef.align}
-                                            sx={{p: 0, minWidth: columnDef.minWidth, width: columnDef.width,}}
+                                            sx={{
+                                                p: columnDef.id === '#rowId' ? '0 2px' : 0,
+                                                minWidth: columnDef.minWidth,
+                                                width: columnDef.width,
+                                            }}
                                         >
-                                            <DraggableHeader
-                                                columnDef={columnDef}
-                                                orderBy={orderBy}
-                                                order={order}
-                                                tableId={tableId}
-                                                onSortClick={() => {
-                                                    let newOrder: 'asc' | 'desc' = 'asc';
-                                                    let newOrderBy : string | undefined = columnDef.id;
-                                                    if (orderBy === columnDef.id && order === 'asc') {
-                                                        newOrder = 'desc';
-                                                    } else if (orderBy === columnDef.id && order === 'desc') {
-                                                        newOrder = 'asc';
-                                                        newOrderBy = undefined;
-                                                    } else {
-                                                        newOrder = 'asc';
-                                                    }
-
-                                                    setOrder(newOrder);
-                                                    setOrderBy(newOrderBy);
-                                                    
-                                                    if (virtual) {
-                                                        fetchVirtualData(newOrderBy ? [newOrderBy] : [], newOrder);
-                                                    }
-                                                }}
-                                            />
+                                            {columnDef.id === '#rowId' ? (
+                                                <Box
+                                                    className="data-view-header-container"
+                                                    sx={{
+                                                        display: 'flex',
+                                                        alignItems: 'center',
+                                                        justifyContent: 'center',
+                                                        borderBottomWidth: '2px',
+                                                        borderBottomStyle: 'solid',
+                                                        borderBottomColor: 'rgba(0,0,0,0.2)',
+                                                        padding: '4px 4px',
+                                                        margin: '0 2px 0 0',
+                                                    }}
+                                                >
+                                                    <Typography
+                                                        sx={{
+                                                            fontSize: textVar.sm,
+                                                            color: 'text.secondary',
+                                                            whiteSpace: 'nowrap',
+                                                        }}
+                                                    >
+                                                        {columnDef.label}
+                                                    </Typography>
+                                                </Box>
+                                            ) : (
+                                                <DraggableHeader
+                                                    columnDef={columnDef}
+                                                    orderBy={orderBy}
+                                                    order={order}
+                                                    tableId={tableId}
+                                                    hasFilter={Boolean(columnFilters[columnDef.id])}
+                                                    onSortAsc={() => applySort(columnDef.id, 'asc')}
+                                                    onSortDesc={() => applySort(columnDef.id, 'desc')}
+                                                    onClearSort={() => applySort(undefined, 'asc')}
+                                                    onOpenFilter={(anchor) => setFilterPopover({ columnId: columnDef.id, anchor })}
+                                                />
+                                            )}
                                         </TableCell>
                                     );
                                 })}
@@ -405,11 +730,6 @@ export const SelectableDataGrid: React.FC<SelectableDataGridProps> = ({
                             <>
                                 {columnDefs.map((column, colIndex) => {
                                     let backgroundColor = "rgba(255,255,255,0.05)";
-                                    // if (column.source == "custom") {
-                                    //     backgroundColor = alpha(theme.palette.custom.main, 0.03);
-                                    // } else {
-                                    //     backgroundColor = "rgba(255,255,255,0.05)";
-                                    // }
 
                                     return (
                                         <TableCell
@@ -417,7 +737,11 @@ export const SelectableDataGrid: React.FC<SelectableDataGridProps> = ({
                                             sx={{backgroundColor}}
                                             align={column.align || 'left'}
                                         >
-                                            {column.format ? column.format(data[column.id]) : data[column.id]}
+                                            {column.format
+                                                ? column.format(data[column.id])
+                                                : (data[column.id] != null && typeof data[column.id] === 'object'
+                                                    ? String(data[column.id])
+                                                    : data[column.id])}
                                         </TableCell>
                                     )
                                 })}
@@ -427,25 +751,38 @@ export const SelectableDataGrid: React.FC<SelectableDataGridProps> = ({
                 />
                 </Box>
             </Fade>
-            <Paper variant="outlined"
-                sx={{ display: 'flex', flexDirection: 'row',  position: 'absolute', bottom: 6, right: 12 }}>
+            {/* Loading-more indicator at the bottom of the scroll area */}
+            {isLoadingMore && (
+                <Box sx={{
+                    position: 'absolute', bottom: 32, left: 0, right: 0, zIndex: 6,
+                    display: 'flex', justifyContent: 'center', py: 0.5,
+                }}>
+                    <CircularProgress size={16} sx={{ color: 'text.secondary' }} />
+                </Box>
+            )}
+            {!hideFooter && <Paper variant="outlined"
+                sx={{ display: 'flex', flexDirection: 'row', position: 'absolute', bottom: 4, right: 20, zIndex: 5 }}>
                 <Box sx={{display: 'flex', alignItems: 'center', mx: 1}}>
-                    <Typography sx={{display: 'flex', alignItems: 'center', fontSize: '12px'}}>
-                        {virtual && <CloudQueueIcon sx={{fontSize: 16, mr: 1}}/> }
-                        {`${rowCount} rows`}
+                    <Typography sx={{display: 'flex', alignItems: 'center', fontSize: textVar.sm}}>
+                        {virtual && <TableIcon sx={{width: 14, height: 14, mr: 1}}/> }
+                        {virtual && rowsToDisplay.length < serverRowCount
+                            ? t('dataGrid.loadedOfTotal', { loaded: rowsToDisplay.length, total: serverRowCount })
+                            : t('dataGrid.rowCount', { count: virtual ? serverRowCount : rowCount })}
                     </Typography>
-                    {virtual && rowCount > 10000 && (
-                        <Tooltip title="view 10000 random rows from this table">
+                    {virtual && serverRowCount > 10000 && (
+                        <Tooltip title={t('dataGrid.viewRandomRows')}>
                             <IconButton 
                                 size="small" 
                                 color="primary" 
                                 sx={{marginRight: 1}}
                                 onClick={() => {
+                                    setOrderBy(undefined);
+                                    setOrder('asc');
                                     fetchVirtualData([], 'asc');
                                 }}
                             >
                                 <CasinoIcon sx={{
-                                    fontSize: 18, 
+                                    fontSize: textVar.xxl, 
                                     '&:hover': {
                                         transform: 'rotate(180deg)'
                                     }
@@ -453,8 +790,59 @@ export const SelectableDataGrid: React.FC<SelectableDataGridProps> = ({
                             </IconButton>
                         </Tooltip>
                     )}
+                    <Tooltip title={isDownloading ? t('dataGrid.downloading') : t('dataGrid.downloadAsCsv')}>
+                        <span>
+                            <IconButton 
+                                size="small" 
+                                color="primary" 
+                                aria-label={t('dataGrid.downloadAsCsv')}
+                                disabled={isDownloading}
+                                onClick={() => handleDownload('csv')}
+                            >
+                                {isDownloading 
+                                    ? <CircularProgress size={16} sx={{ color: 'inherit' }} />
+                                    : <FileDownloadIcon sx={{ fontSize: iconVar.lg }} />
+                                }
+                            </IconButton>
+                        </span>
+                    </Tooltip>
                 </Box>
-            </Paper>
+            </Paper>}
+            {/* Column filter popover — variant chosen synchronously from metadata
+                (design-doc 31). Server-side pushdown via fetchVirtualData. */}
+            {filterPopover && (() => {
+                const meta = tableMetadata?.[filterPopover.columnId];
+                const colDef = columnDefs.find(c => c.id === filterPopover.columnId);
+                return (
+                    <ColumnFilterPopover
+                        anchor={filterPopover.anchor}
+                        open={true}
+                        onClose={() => setFilterPopover(null)}
+                        columnId={filterPopover.columnId}
+                        columnLabel={colDef?.label || filterPopover.columnId}
+                        dataType={colDef?.dataType}
+                        distinctCount={meta?.distinctCount}
+                        nullCount={meta?.nullCount}
+                        levels={meta?.levels}
+                        levelCounts={meta?.levelCounts}
+                        currentFilter={columnFilters[filterPopover.columnId]}
+                        onApply={(f) => {
+                            setColumnFilters(prev => {
+                                const next = { ...prev };
+                                if (f) next[filterPopover.columnId] = f;
+                                else delete next[filterPopover.columnId];
+                                return next;
+                            });
+                        }}
+                        rowCount={rowCount}
+                        isSorted={orderBy === filterPopover.columnId}
+                        sortOrder={order}
+                        onSortAsc={() => applySort(filterPopover.columnId, 'asc')}
+                        onSortDesc={() => applySort(filterPopover.columnId, 'desc')}
+                        onClearSort={() => applySort(undefined, 'asc')}
+                    />
+                );
+            })()}
         </Box >
     );
-}
+});

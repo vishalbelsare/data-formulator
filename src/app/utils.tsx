@@ -4,36 +4,33 @@
 import _, {  } from "lodash";
 import { useEffect, useRef } from "react";
 import ts from "typescript";
-import { ChannelGroups, getChartChannels, getChartTemplate } from "../components/ChartTemplates";
-import { Channel, Chart, ChartTemplate, ConceptTransformation, EncodingItem, EncodingMap, FieldItem, Trigger } from "../components/ComponentType";
+import { Channel, Chart, EncodingItem, EncodingMap, FieldItem, FieldSemanticsInfo, Trigger } from "../components/ComponentType";
 import { DictTable } from "../components/ComponentType";
-import { getDType, Type } from "../data/types";
+import { Type } from "../data/types";
 import * as d3 from 'd3';
+
+import { assembleVegaLite, type ChartEncoding, type AssembleOptions } from "flint-chart";
+import { getBrowserId } from './identity';
 
 export function getUrls() {
     return {
-        GET_SESSION_ID: `/api/get-session-id`,
         APP_CONFIG: `/api/app-config`,
         AUTH_INFO_PREFIX: `/api/.auth/`,
 
-        EXAMPLE_DATASETS: `/api/example-datasets`,
-
         // these functions involves ai agents
+        LIST_GLOBAL_MODELS: `/api/agent/list-global-models`,
         CHECK_AVAILABLE_MODELS: `/api/agent/check-available-models`,
         TEST_MODEL: `/api/agent/test-model`,
 
-        DERIVE_CONCEPT_URL: `/api/agent/derive-concept-request`,
-        DERIVE_PY_CONCEPT: `/api/agent/derive-py-concept`,
-
         SORT_DATA_URL: `/api/agent/sort-data`,
-        CLEAN_DATA_URL: `/api/agent/clean-data-stream`,
+        DATA_LOADING_CHAT_URL: `/api/agent/data-loading-chat`,
+        SCRATCH_UPLOAD_URL: `/api/agent/workspace/scratch/upload`,
+        SCRATCH_BASE_URL: `/api/agent/workspace/scratch`,
         
         CODE_EXPL_URL: `/api/agent/code-expl`,
         SERVER_PROCESS_DATA_ON_LOAD: `/api/agent/process-data-on-load`,
 
-        DERIVE_DATA: `/api/agent/derive-data`,
-        REFINE_DATA: `/api/agent/refine-data`,
-        EXPLORE_DATA_STREAMING: `/api/agent/explore-data-streaming`,
+        ANALYST_STREAMING: `/api/agent/analyst-streaming`,
 
         // these functions involves database
         UPLOAD_DB_FILE: `/api/tables/upload-db-file`,
@@ -43,145 +40,265 @@ export function getUrls() {
         LIST_TABLES: `/api/tables/list-tables`,
         TABLE_DATA: `/api/tables/get-table`,
         CREATE_TABLE: `/api/tables/create-table`,
+        PARSE_FILE: `/api/tables/parse-file`,
         DELETE_TABLE: `/api/tables/delete-table`,
         GET_COLUMN_STATS: `/api/tables/analyze`,
         SAMPLE_TABLE: `/api/tables/sample-table`,
-
-        DATA_LOADER_LIST_DATA_LOADERS: `/api/tables/data-loader/list-data-loaders`,
-        DATA_LOADER_LIST_TABLES: `/api/tables/data-loader/list-tables`,
-        DATA_LOADER_INGEST_DATA: `/api/tables/data-loader/ingest-data`,
-        DATA_LOADER_VIEW_QUERY_SAMPLE: `/api/tables/data-loader/view-query-sample`,
-        DATA_LOADER_INGEST_DATA_FROM_QUERY: `/api/tables/data-loader/ingest-data-from-query`,
-        DATA_LOADER_REFRESH_TABLE: `/api/tables/data-loader/refresh-table`,
-        DATA_LOADER_GET_TABLE_METADATA: `/api/tables/data-loader/get-table-metadata`,
-        DATA_LOADER_LIST_TABLE_METADATA: `/api/tables/data-loader/list-table-metadata`,
+        SYNC_TABLE_DATA: `/api/tables/sync-table-data`,
+        EXPORT_TABLE_CSV: `/api/tables/export-table-csv`,
 
         GET_RECOMMENDATION_QUESTIONS: `/api/agent/get-recommendation-questions`,
-        GENERATE_REPORT_STREAM: `/api/agent/generate-report-stream`,
+
+        // Starter exploration questions (generated on data load)
+        DERIVE_STARTER_QUESTIONS: `/api/agent/derive-starter-questions`,
+
+        // Workspace display name (auto-naming)
+        WORKSPACE_NAME: `/api/agent/workspace-name`,
+
+        // NL-to-filter
+        NL_TO_FILTER: `/api/agent/nl-to-filter`,
+
+        // Chart style refinement (restyle agent)
+        CHART_RESTYLE: `/api/agent/chart-restyle`,
+
+        // Intent classifier — routes a chart prompt to restyle vs. data agent
+        CLASSIFY_CHART_INTENT: `/api/agent/classify-chart-intent`,
 
         // Refresh data endpoint
-        REFRESH_DERIVED_DATA: `/api/tables/refresh-derived-data`,
+        REFRESH_DERIVED_DATA: `/api/agent/refresh-derived-data`,
+
+        // Server logs (local mode only)
+        LOGS_INFO: `/api/logs/info`,
+        LOGS_TAIL: `/api/logs/tail`,
+        LOGS_DOWNLOAD: `/api/logs/download`,
+        MODEL_ENDPOINTS: `/api/model-endpoints`,
+
+        // Session management
+        SESSION_SAVE: `/api/sessions/save`,
+        SESSION_LIST: `/api/sessions/list`,
+        SESSION_LOAD: `/api/sessions/load`,
+        SESSION_DELETE: `/api/sessions/delete`,
+        SESSION_EXPORT: `/api/sessions/export`,
+        SESSION_IMPORT: `/api/sessions/import`,
+        SESSION_UPDATE_META: `/api/sessions/update-meta`,
+
+        // Workspace
+        OPEN_WORKSPACE: `/api/tables/open-workspace`,
     };
 }
 
 /**
- * List of API endpoints that require a session ID
- * These endpoints will automatically fetch session ID if missing
+ * Structured reference to a table in an external data source.
+ * - `id`:   opaque identifier the backend loader needs (e.g. numeric dataset_id for Superset,
+ *           "schema.table" for a SQL database).
+ * - `name`: human-readable label used for display and workspace file naming.
  */
-const SESSION_REQUIRED_ENDPOINTS = [
-    '/api/tables/upload-db-file',
-    '/api/tables/download-db-file',
-    '/api/tables/reset-db-file',
-    '/api/tables/list-tables',
-    '/api/tables/get-table',
-    '/api/tables/create-table',
-    '/api/tables/delete-table',
-    '/api/tables/analyze',
-    '/api/tables/sample-table',
-    '/api/tables/data-loader/list-tables',
-    '/api/tables/data-loader/ingest-data',
-    '/api/tables/data-loader/view-query-sample',
-    '/api/tables/data-loader/ingest-data-from-query',
-    '/api/tables/data-loader/refresh-table',
-    '/api/tables/data-loader/get-table-metadata',
-    '/api/tables/data-loader/list-table-metadata',
-    '/api/tables/refresh-derived-data',
-];
-
-/**
- * Enhanced fetch wrapper that automatically handles session ID at the app level
- * If a request fails with "No session ID found" or similar errors,
- * it will automatically fetch the session ID and retry the request
- * 
- * This function can be used as a drop-in replacement for fetch() in components
- * that have access to Redux dispatch
- * 
- * @param url - The URL to fetch
- * @param options - Fetch options (same as native fetch)
- * @param dispatch - Redux dispatch function (optional, will try to get from store if not provided)
- * @returns Promise<Response>
- */
-export async function fetchWithSession(
-    url: string | URL,
-    options: RequestInit = {},
-    dispatch?: any
-): Promise<Response> {
-    const urlString = typeof url === 'string' ? url : url.toString();
-    
-    // Check if this endpoint requires session ID
-    const requiresSession = SESSION_REQUIRED_ENDPOINTS.some(endpoint => 
-        urlString.includes(endpoint)
-    );
-    
-    // Make the initial request
-    let response = await fetch(url, options);
-    
-    // If the response indicates a session ID issue, try to fetch it and retry
-    if (requiresSession && !response.ok) {
-        try {
-            const errorData = await response.clone().json().catch(() => null);
-            const errorMessage = errorData?.message || errorData?.error || '';
-            
-            // Check if error is related to missing session ID
-            if (errorMessage.toLowerCase().includes('session') && 
-                (errorMessage.toLowerCase().includes('not found') || 
-                 errorMessage.toLowerCase().includes('no session'))) {
-                
-                // Try to get dispatch from store if not provided
-                let dispatchFn = dispatch;
-                if (!dispatchFn) {
-                    try {
-                        const { store } = await import('./store');
-                        dispatchFn = store.dispatch;
-                    } catch (storeError) {
-                        console.error('Failed to access store:', storeError);
-                        // Return the original error response
-                        return response;
-                    }
-                }
-                
-                // Fetch session ID and retry
-                if (dispatchFn) {
-                    try {
-                        const { getSessionId } = await import('./dfSlice');
-                        // Dispatch the thunk and unwrap the result
-                        await dispatchFn(getSessionId()).unwrap();
-                        
-                        // Retry the original request
-                        response = await fetch(url, options);
-                    } catch (sessionError) {
-                        console.error('Failed to fetch session ID:', sessionError);
-                        // Return the original error response
-                    }
-                }
-            }
-        } catch (parseError) {
-            // If we can't parse the error, just return the original response
-        }
-    }
-    
-    return response;
+export interface SourceTableRef {
+    id: string;
+    name: string;
 }
 
 /**
- * React hook that provides a fetch function with automatic session ID handling
- * Use this in components instead of native fetch for API calls that require session ID
- * 
- * @example
- * const fetchWithSession = useFetchWithSession();
- * const response = await fetchWithSession('/api/tables/list-tables');
+ * Static API URLs for connector actions.
+ * All action routes accept `connector_id` in the JSON body.
  */
-export function useFetchWithSession() {
-    // Dynamic import to avoid circular dependency
-    const { useDispatch } = require('react-redux');
-    const dispatch = useDispatch();
-    
-    return (url: string | URL, options: RequestInit = {}) => 
-        fetchWithSession(url, options, dispatch);
+export const CONNECTOR_ACTION_URLS = {
+    DISCOVER_OPTIONS: '/api/data-loaders/discover-options',
+    CONNECT: '/api/connectors/connect',
+    DISCONNECT: '/api/connectors/disconnect',
+    GET_STATUS: '/api/connectors/get-status',
+    GET_CATALOG: '/api/connectors/get-catalog',
+    GET_CATALOG_TREE: '/api/connectors/get-catalog-tree',
+    GET_CATALOG_PROGRESS: '/api/connectors/get-catalog-progress',
+    SEARCH_CATALOG: '/api/connectors/search-catalog',
+    SYNC_CATALOG_METADATA: '/api/connectors/sync-catalog-metadata',
+    GET_CACHED_CATALOG_TREE: '/api/connectors/get-cached-catalog-tree',
+    IMPORT_DATA: '/api/connectors/import-data',
+    REFRESH_DATA: '/api/connectors/refresh-data',
+    PREVIEW_DATA: '/api/connectors/preview-data',
+    IMPORT_GROUP: '/api/connectors/import-group',
+    COLUMN_VALUES: '/api/connectors/column-values',
+} as const;
+
+/** Global connector management URLs. */
+export const CONNECTOR_URLS = {
+    DATA_LOADERS: '/api/data-loaders',
+    LIST: '/api/connectors',
+    CREATE: '/api/connectors',
+    UPDATE: (id: string) => `/api/connectors/${id}`,
+    DELETE: (id: string) => `/api/connectors/${id}`,
+} as const;
+
+/**
+ * Get the current namespaced identity from the Redux store, or fall back to browser ID.
+ * Returns identity in "type:id" format (e.g., "user:alice@example.com" or "browser:550e8400-...")
+ * 
+ * This namespaced format ensures the backend can distinguish between authenticated users
+ * and anonymous browser sessions, preventing identity spoofing attacks.
+ */
+async function getCurrentNamespacedIdentity(): Promise<string> {
+    try {
+        const { store } = await import('./store');
+        const state = store.getState();
+        if (state.identity?.id && state.identity?.type) {
+            return `${state.identity.type}:${state.identity.id}`;
+        }
+    } catch (e) {
+        // Store not available
+    }
+    // Fall back to browser ID from localStorage
+    return `browser:${getBrowserId()}`;
+}
+
+// getAccessToken / getUserManager are imported lazily to avoid circular deps
+// and to keep the module working when oidc-client-ts is not bundled.
+
+/**
+ * Get the active workspace ID from the Redux store.
+ * Returns null if no workspace is active.
+ */
+async function getActiveWorkspaceId(): Promise<string | null> {
+    try {
+        const { store } = await import('./store');
+        const state = store.getState();
+        return state?.activeWorkspace?.id ?? null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Build a request with identity / auth / workspace headers, then execute a
+ * single `fetch`. This is the inner workhorse
+ * called by {@link fetchWithIdentity} (which wraps it with 401 retry).
+ */
+async function _doFetch(
+    url: string | URL,
+    options: RequestInit = {}
+): Promise<Response> {
+    const urlString = typeof url === 'string' ? url : url.toString();
+
+    if (urlString.startsWith('/api/')) {
+        const headers = new Headers(options.headers);
+
+        const namespacedIdentity = await getCurrentNamespacedIdentity();
+        headers.set('X-Identity-Id', namespacedIdentity);
+
+        const workspaceId = await getActiveWorkspaceId();
+        if (workspaceId && !headers.has('X-Workspace-Id')) {
+            headers.set('X-Workspace-Id', workspaceId);
+        }
+
+        headers.set('Accept-Language', getAgentLanguage());
+
+        // Attach OIDC Bearer token when available (frontend mode only).
+        // In backend mode the session cookie handles auth — no Bearer needed.
+        try {
+            const { getAccessToken, isBackendAuth } = await import('./oidcConfig');
+            const backend = await isBackendAuth();
+            if (!backend) {
+                const accessToken = await getAccessToken();
+                if (accessToken) {
+                    headers.set('Authorization', `Bearer ${accessToken}`);
+                }
+            }
+        } catch {
+            // oidc-client-ts not available — anonymous mode
+        }
+
+        options = { ...options, headers };
+
+        console.log(
+            `[fetchWithIdentity] ${options.method || 'GET'} ${urlString} with headers:`,
+            Object.fromEntries(headers.entries()),
+        );
+
+    }
+
+    return fetch(url, options);
+}
+
+/**
+ * Enhanced fetch wrapper that automatically adds identity and auth headers
+ * for API requests.
+ *
+ * Security model:
+ * - `X-Identity-Id`: Namespaced identity (`"type:id"` format) for all requests
+ * - `Authorization: Bearer <token>`: OIDC access-token when available
+ *
+ * On a 401 response the function attempts a silent OIDC token refresh and
+ * retries the request exactly once.  If the retry also fails (or OIDC is not
+ * active) the original 401 response is returned.
+ *
+ * Use this instead of native `fetch()` for all `/api/` calls.
+ */
+export async function fetchWithIdentity(
+    url: string | URL,
+    options: RequestInit = {}
+): Promise<Response> {
+    const resp = await _doFetch(url, options);
+
+    if (resp.status === 401) {
+        try {
+            const { getUserManager } = await import('./oidcConfig');
+            const mgr = await getUserManager();
+            if (mgr) {
+                await mgr.signinSilent();
+                return _doFetch(url, options);
+            }
+        } catch {
+            // Silent renew failed or OIDC not available — return original 401
+        }
+    }
+
+    return resp;
+}
+
+import i18n from '../i18n';
+
+/**
+ * Returns the current UI language code (e.g. "zh", "en") for use in agent API requests.
+ */
+export function getAgentLanguage(): string {
+    return i18n.language.split('-')[0];
+}
+
+/**
+ * Translate a backend message using an optional ``message_code`` / ``content_code``.
+ *
+ * The backend sends English text as the default value plus a code that maps
+ * to a key under ``messages.agent.*`` in the i18n locale files.  If no code
+ * is provided or no translation exists, the original English text is returned.
+ *
+ * @example
+ *   translateBackend(event.message, event.message_code, event.message_params)
+ *   translateBackend(result.content, result.content_code)
+ */
+export function translateBackend(
+    fallback: string,
+    code?: string,
+    params?: Record<string, unknown>,
+): string {
+    if (!code) return fallback;
+    const key = `messages.${code}`;
+    const translated = i18n.t(key, { ...params, defaultValue: fallback });
+    return translated;
+}
+
+/**
+ * Translate a list of backend option labels using parallel code arrays.
+ */
+export function translateBackendOptions(
+    options: string[],
+    codes?: string[],
+): string[] {
+    if (!codes || codes.length === 0) return options;
+    return options.map((opt, i) =>
+        codes[i] ? translateBackend(opt, codes[i]) : opt,
+    );
 }
 
 import * as vm from 'vm-browserify';
-import { generateFreshChart } from "./dfSlice";
 
 export function usePrevious<T>(value: T): T | undefined {
     const ref = useRef<T>();
@@ -356,36 +473,7 @@ export function extractFieldsFromEncodingMap(encodingMap: EncodingMap, allFields
     return { aggregateFields, groupByFields };
 }
 
-/**
- * Check if a numeric value is likely a Unix timestamp (seconds or milliseconds since epoch).
- * Returns false for values that look like years or other small numbers.
- */
-function isLikelyTimestamp(val: number): boolean {
-    // Unix timestamps in seconds: typically 10 digits (starts from ~1970)
-    // Unix timestamps in milliseconds: typically 13 digits
-    // Reasonable timestamp range: 1970 (0) to 2100 (~4102444800 seconds)
-    
-    // Milliseconds range: 1970 to 2100
-    const minTimestampMs = 0;  // Jan 1, 1970
-    const maxTimestampMs = 4102444800000;  // ~year 2100
-    
-    // Seconds range: 1970 to 2100
-    const minTimestampSec = 0;
-    const maxTimestampSec = 4102444800;  // ~year 2100
-    
-    // Check if it looks like milliseconds (13 digits, typically > 1e12)
-    if (val >= 1e12 && val <= maxTimestampMs) {
-        return true;
-    }
-    
-    // Check if it looks like seconds (10 digits, typically > 1e9)
-    // Must be > 1e9 to avoid confusion with years (1000-9999)
-    if (val >= 1e9 && val <= maxTimestampSec) {
-        return true;
-    }
-    
-    return false;
-}
+
 
 export function prepVisTable(table: any[], allFields: FieldItem[], encodingMap: EncodingMap) {
     let { aggregateFields, groupByFields } = extractFieldsFromEncodingMap(encodingMap, allFields);
@@ -446,729 +534,116 @@ export const assembleVegaChart = (
     encodingMap: { [key in Channel]: EncodingItem; }, 
     conceptShelfItems: FieldItem[], 
     workingTable: any[],
-    tableMetadata: {[key: string]: {type: Type, semanticType: string, levels: any[]}},
-    maxFacetNominalValues: number = 30,
-    aggrPreprocessed: boolean = false, // whether the data has been preprocessed for aggregation and binning
-    defaultChartWidth: number = 100,
-    defaultChartHeight: number = 80,
-    addTooltips: boolean = false
+    tableMetadata: {[key: string]: {type: Type, levels: any[], description?: string}},
+    baseChartWidth: number = 100,
+    baseChartHeight: number = 80,
+    addTooltips: boolean = false,
+    chartProperties?: Record<string, any>,
+    scaleFactor: number = 1,
+    maxStretchFactor?: number,
+    assembleOptions?: AssembleOptions,
+    fieldSemantics?: Record<string, FieldSemanticsInfo>,
+    title?: string,
+    subtitle?: string,
+    themeId?: string,
 ) => {
 
-    if (chartType == "Table") {
-        return ["Table", undefined];
-    }
-
-    let chartTemplate = getChartTemplate(chartType) as ChartTemplate;
-    //console.log(chartTemplate);
-
-    let vgObj = structuredClone(chartTemplate.template);
-
+    // Convert app-level EncodingMap (fieldID-based) to library-level encodings (field-name-based)
+    const encodings: Record<string, ChartEncoding> = {};
     for (const [channel, encoding] of Object.entries(encodingMap)) {
-
-        let encodingObj: any = {};
-
-        if (channel == "radius") {
-            encodingObj["scale"] = {"type": "sqrt", "zero": true};
-        }
-
         const field = encoding.fieldID ? _.find(conceptShelfItems, (f) => f.id === encoding.fieldID) : undefined;
-        if (field == undefined && encoding.aggregate == "count" && aggrPreprocessed) {
-            encodingObj["field"] = "_count";
-            encodingObj["title"] = "Count";
-            encodingObj["type"] = "quantitative";
-        }
-        
-        if (field) {
-            // create the encoding
-            encodingObj["field"] = field.name;
-            let fieldMetadata = tableMetadata[field.name];
+        encodings[channel] = {
+            field: field?.name,
+            type: encoding.dtype,
+            aggregate: encoding.aggregate,
+            sortOrder: encoding.sortOrder,
+            sortBy: encoding.sortBy,
+            scheme: encoding.scheme,
+        };
+    }
 
-            if (fieldMetadata != undefined) {
-                let fieldValues = workingTable.map(r => r[field.name]);
-                encodingObj["type"] = getDType(fieldMetadata.type, fieldValues);
-
-                if (fieldMetadata.semanticType == "Date" || fieldMetadata.semanticType == "DateTime" || fieldMetadata.semanticType == "YearMonth" || fieldMetadata.semanticType == "Year" || fieldMetadata.semanticType == "Decade") {
-                    if (['color', 'size', 'column', 'row'].includes(channel)) {
-                        encodingObj["type"] = "nominal";
-                    } else if (fieldMetadata.type == "string" && (fieldMetadata.semanticType == "Decade" || fieldMetadata.semanticType == "Year")) {
-                        encodingObj["type"] = "nominal";
-                    } else if (fieldMetadata.semanticType == 'YearMonth') {
-                        let sampleValues = workingTable.map(r => r[field.name]).slice(0, 10);
-                        // Check if values can be parsed as valid temporal dates (Vega-Lite compatible)
-                        // Temporal: yyyy-mm, yyyy-mm-dd, ISO date formats
-                        // Nominal: 2021-Aug, Q1-2024, etc.
-                        let isValidTemporal = sampleValues.some(val => {
-                            if (val && typeof val === 'string') {
-                                const trimmed = val.trim();
-                                // Try to parse as date
-                                const date = new Date(trimmed);
-                                // Check if it's a valid date and follows ISO-like format
-                                // (no letters except 'T' for datetime separator, 'Z' for timezone)
-                                const isISOLike = /^[\d\-:.TZ+]+$/.test(trimmed);
-                                return !isNaN(date.getTime()) && isISOLike;
-                            }
-                            return false;
-                        });
-                        encodingObj["type"] = isValidTemporal ? "temporal" : "nominal";
-                    } else {
-                        encodingObj["type"] = "temporal";
-                    }
-                }
-            } else {
-                encodingObj["type"] = 'nominal';
-            }
-
-           
-
-            if (encoding.dtype) {
-                // if the dtype is specified, use it
-                encodingObj["type"] = encoding.dtype;
-            } else if (channel == 'column' || channel == 'row') {
-                // if the column or row channel and no dtype is specified, use nominal
-                encodingObj["type"] = 'nominal';
-            }
-
-            if (field && encodingObj["type"] == "quantitative") {
-                // TODO: special hack: if the field values are all valid temporal values, set the type to temporal
-                let sampleValues = workingTable.slice(0, 15).filter(r => r[field.name] != undefined).map(r => r[field.name]);
-                // ISO 8601 format: YYYY-MM-DDTHH:mm:ss.sss with optional timezone (Z or +/-HH:mm)
-                const isoDateRegex = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$/;
-                if (sampleValues.length > 0 && sampleValues.every((val: any) => isoDateRegex.test(`${val}`.trim()))) {
-                    encodingObj["type"] = "temporal";
-                }
-            }
-            
-            
-            if (aggrPreprocessed) {
-                if (encoding.aggregate) {
-                    if (encoding.aggregate == "count") {
-                        encodingObj["field"] = "_count";
-                        encodingObj["title"] = "Count"
-                        encodingObj["type"] = "quantitative";
-                    } else {
-                        encodingObj['field'] = `${field.name || ""}_${encoding.aggregate}`;
-                        encodingObj["type"] = "quantitative";
-                    }
-                }
-            } else {
-                if (encoding.aggregate) {
-                    encodingObj["aggregate"] = encoding.aggregate;
-                    if (encodingObj["aggregate"] == "count") {
-                        encodingObj["title"] = "Count"
-                    }
-                }
-            }
- 
-            if (encodingObj["type"] == "quantitative" && chartType.includes("Line") && channel == "x") {
-                encodingObj["scale"] = { "nice": false }
-            }
-
-            if (encodingObj["type"] == "nominal" && channel == 'color') {
-
-                let actualDomain = [...new Set(workingTable.map(r => r[field.name]))];
-
-                if (actualDomain.length >= 16) {
-                    if (encodingObj["legend"] == undefined) {
-                        encodingObj["legend"] = {}
-                    }
-                    encodingObj["legend"]['symbolSize'] = 12;
-                    encodingObj["legend"]["labelFontSize"] = 8;
-                }
-            }
-        }
-
-        if (encoding.sortBy || encoding.sortOrder) {
-            if (encoding.sortBy == undefined) {
-                if (encoding.sortOrder) {
-                    encodingObj["sort"] = encoding.sortOrder;
-                }
-            } else if (encoding.sortBy == 'x' || encoding.sortBy == 'y') {
-                if (encoding.sortBy == channel) {
-                    encodingObj["sort"] = `${encoding.sortOrder == "descending" ? "-" : ""}${encoding.sortBy}`;
-                } else {
-                    encodingObj["sort"] = `${encoding.sortOrder == "ascending" ? "" : "-"}${encoding.sortBy}`;
-                }
-
-            } else if (encoding.sortBy == 'color') {
-                if (encodingMap.color?.fieldID != undefined) {
-                    encodingObj["sort"] = `${encoding.sortOrder == "ascending" ? "" : "-"}${encoding.sortBy}`;
-                }
-            } else {
-                try {
-                    if (field) {
-                        let fieldMetadata = tableMetadata[field.name];
-                        let sortedValues = JSON.parse(encoding.sortBy);
-
-                        // this is to coordinate with the type conversion of temporal fields
-                        if (fieldMetadata.type == "date" || fieldMetadata.semanticType == "Year" || fieldMetadata.semanticType == "Decade") {
-                            sortedValues = sortedValues.map((v: any) => v.toString());
-                        }
-
-                        encodingObj['sort'] = (encoding.sortOrder == "ascending" || encoding.sortOrder == undefined) ? sortedValues : sortedValues.reverse();
-
-                        // special hack: ensure stack bar and stacked area charts are ordered correctly
-                        if (channel == 'color' && (vgObj['mark'] == 'bar' || vgObj['mark'] == 'area')) {
-                            // this is a very interesting hack, it leverages the hidden derived field name used in compiled Vega script to 
-                            // handle order of stack bar and stacked area charts
-                            vgObj['encoding']['order'] = {
-                                "field": `color_${field?.name}_sort_index`,
-                            }
-                        }
-                    }
-                } catch (err) {
-                    console.warn(`sort error > ${encoding.sortBy}`)
-                }
-            }
-
-            // if (encoding.sort == "ascending" || encoding.sort == "descending"
-            //     || encoding.sort == "x" || encoding.sort == "y" || encoding.sort == "-x" || encoding.sort == "-y") {
-            //     encodingObj["sort"] = encoding.sort;
-            // } else {
-            //     encodingObj["sort"] = JSON.parse(encoding.sort);
-            // }
-        } else {
-            // Auto-sort: when nominal axis has quantitative opposite axis or color field and no explicit sorting is set
-            // prioritize color field if present, otherwise sort by quantitative axis descending
-            if ((channel === 'x' && encodingObj.type === 'nominal' && encodingMap.y?.fieldID ) ||
-                (channel === 'y' && encodingObj.type === 'nominal' && encodingMap.x?.fieldID)) {
-
-
-
-                if (chartType.includes("Line") || chartType.includes("Area")) {
-                    // do nothing
-                } else {
-                    let colorField = encodingMap.color?.fieldID ? _.find(conceptShelfItems, (f) => f.id === encodingMap.color.fieldID) : undefined;
-                    let colorFieldType = undefined;
-                    if (colorField) {
-                        const colorFieldMetadata = tableMetadata[colorField.name];
-                        if (colorFieldMetadata) {
-                            colorFieldType = getDType(colorFieldMetadata.type, workingTable.map(r => r[colorField.name]));
-                        }
-                    }
-
-                    if (colorField && colorFieldType == 'quantitative') {
-                        // If color field exists, sort by color (ascending for nominal, descending for quantitative)
-                        encodingObj["sort"] = colorFieldType === 'quantitative' ? "-color" : "color";
-                    }  else {
-                        // Otherwise, sort by the quantitative axis descending
-                        const oppositeChannel = channel === 'x' ? 'y' : 'x';
-                        const oppositeField = _.find(conceptShelfItems, (f) => f.id === encodingMap[oppositeChannel]?.fieldID);
-                        if (oppositeField) {
-                            const oppositeFieldMetadata = tableMetadata[oppositeField.name];
-                            if (oppositeFieldMetadata && getDType(oppositeFieldMetadata.type, workingTable.map(r => r[oppositeField.name])) === 'quantitative') {
-                                encodingObj["sort"] = `-${oppositeChannel}`;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if (encoding.stack) {
-            encodingObj["stack"] = encoding.stack == "layered" ? null : encoding.stack;
-        }
-
-        if (channel == "color") {
-            if (encoding.scheme && encoding.scheme != "default") {
-                if ('scale' in encodingObj) {
-                    encodingObj["scale"]["scheme"] = encoding.scheme;
-                } else {
-                    encodingObj["scale"] =  {"scheme": encoding.scheme };
-                }
-            } else {
-                if (field) {
-                    let fieldMetadata = tableMetadata[field.name];
-                    if (fieldMetadata && ["Duration", "Range", "Percentage"].includes(fieldMetadata.semanticType) && encodingObj.type == "nominal") {
-                        let candidateSchemes = ['oranges', 'reds', 'blueorange', 'bluepurple'];
-                        if (!('scale' in encodingObj)) {
-                            encodingObj["scale"] = {};
-                        }
-                        encodingObj["scale"]["scheme"] = candidateSchemes[Math.abs(hashCode(field.name) % candidateSchemes.length)];
-                    } 
-                }
-            }
-        }
-
-        if (Object.keys(encodingObj).length != 0 && chartTemplate.paths[channel]) {
-            let pathObj = chartTemplate.paths[channel];
-            let paths : (string | number)[][] = []
-            if (pathObj.length > 0 && pathObj[0].constructor === Array) {
-                // in this case, there are many destinations, we add the encodingObj to all paths
-                paths = pathObj as (string | number)[][];
-            } else {
-                // in this case, there is only one single destination, we will wrap it with [..]
-                paths = [pathObj as (string | number)[]]
-            }
-            // fill the template with encoding objects
-            for (let path of paths) {
-                let ref = vgObj;
-                for (let key of path.slice(0, path.length - 1)) {
-                    ref = ref[key]
-                }
-
-                // if the template hold is a string, then we only instantiate a string value
-                // if the template hold is a dict, then we embed the actual embeding object
-                if (typeof ref[path[path.length - 1]] === 'string' || ref[path[path.length - 1]] instanceof String) {
-                    ref[path[path.length - 1]] = encodingObj['field'];
-                } else {
-                    let prebuiltEntries = ref[path[path.length - 1]] != undefined ? Object.entries(ref[path[path.length - 1]]) : []
-                    ref[path[path.length - 1]] = Object.fromEntries([...prebuiltEntries, ...Object.entries(encodingObj)]);
-                }
-            }
+    const semanticTypes: Record<string, string | any> = {};
+    for (const [fieldName, info] of Object.entries(fieldSemantics ?? {})) {
+        if (info.semanticType) {
+            const { displayName: _displayName, ...annotation } = info;
+            semanticTypes[fieldName] = Object.keys(annotation).length === 1
+                ? info.semanticType
+                : annotation;
         }
     }
 
-    // use post processor to handle smart chart instantiation
-    if (chartTemplate.postProcessor) {
-        vgObj = chartTemplate.postProcessor(vgObj, workingTable);
+    const effectiveW = Math.round(baseChartWidth * scaleFactor);
+    const effectiveH = Math.round(baseChartHeight * scaleFactor);
+
+    // Flint 0.2.x sizing: `baseSize` is the target the chart aims for; `canvasSize`
+    // is the hard ceiling (= base × stretch). DF's `maxStretchFactor` is that
+    // multiplier; fall back to 1.5 so the ceiling is always set explicitly rather
+    // than relying on flint's default. (Radial charts — pie/rose/etc. — render at the
+    // target like any other type under flint 0.2.1, so no pie-specific damping.)
+    const stretch = maxStretchFactor ?? 1.5;
+
+    const fieldDisplayNames: Record<string, string> = {};
+    for (const [name, info] of Object.entries(fieldSemantics ?? {})) {
+        if (info.displayName) fieldDisplayNames[name] = info.displayName;
     }
 
-    // this is the data that will be assembled into the vega chart
-    let values = structuredClone(workingTable);
-    if (values.length > 0) {
-        let keys = Object.keys(values[0]);
-        let temporalKeys = keys.filter((k: string) => 
-            tableMetadata[k] && (tableMetadata[k].type == "date" || tableMetadata[k].semanticType == "Year" || tableMetadata[k].semanticType == "Decade"));
-        if (temporalKeys.length > 0) {
-            values = values.map((r: any) => { 
-                for (let temporalKey of temporalKeys) {
-                    const val = r[temporalKey];
-                    const fieldMeta = tableMetadata[temporalKey];
-                    const semanticType = fieldMeta?.semanticType;
-                    
-                    // Convert to ISO date strings for Vega-Lite compatibility
-                    if (typeof val === 'number') {
-                        // Handle Year/Decade semantic types - these are year numbers, not timestamps
-                        if (semanticType === 'Year' || semanticType === 'Decade') {
-                            // Year values like 2018 should become "2018-01-01"
-                            r[temporalKey] = `${Math.floor(val)}`;
-                        } else if (isLikelyTimestamp(val)) {
-                            // Detect if timestamp is in seconds (10 digits) or milliseconds (13 digits)
-                            const timestamp = val < 1e12 ? val * 1000 : val;
-                            r[temporalKey] = new Date(timestamp).toISOString();
-                        } else {
-                            // Small numbers that aren't Year/Decade and don't look like timestamps
-                            // If it looks like a year (1000-9999), format as a date for consistency
-                            r[temporalKey] = String(val);
-                        }
-                    } else if (val instanceof Date) {
-                        r[temporalKey] = val.toISOString();
-                    } else {
-                        r[temporalKey] = String(val);
-                    }
-                }
-                return r;
-            })
-        }
-    }
-
-    let nominalCount = {
-        x: 0,
-        y: 0,
-        column: 0,
-        row: 0,
-        xOffset: 0,
-    }
-
-    // by default, we allow strech width twice and fit as many bars as possible with minStepSize
-    let defaultStepSize = 20;
-    let maxXYToKeep = Math.min(defaultChartWidth * 2 / defaultStepSize, 48);
-
-    // Decide what are top values to keep for each channel
-    for (const channel of ['x', 'y', 'column', 'row', 'xOffset', "color"]) {
-        const encoding = vgObj.encoding?.[channel];
-        if (encoding?.type === 'nominal') {
-
-            let maxNominalValuesToKeep = channel == 'x' || channel == 'y' ?  maxXYToKeep : maxFacetNominalValues;
-
-            const fieldName = encoding.field;
-            const uniqueValues = [...new Set(values.map((r: any) => r[fieldName]))];
-
-            // count the nominal values in this channel
-            nominalCount[channel as keyof typeof nominalCount] = uniqueValues.length > maxNominalValuesToKeep ? maxNominalValuesToKeep : uniqueValues.length;
-
-            let fieldMetadata = tableMetadata[fieldName];
-            
-            const fieldOriginalType = fieldMetadata ? getDType(fieldMetadata.type, workingTable.map(r => r[fieldName])) : 'nominal';
-            
-            let valuesToKeep: any[];
-            if (uniqueValues.length > maxNominalValuesToKeep) {
-
-                if (fieldOriginalType == 'quantitative' || channel == 'color') {
-                    valuesToKeep = uniqueValues.sort((a, b) => a - b).slice(0, channel == 'color' ? 24 : maxNominalValuesToKeep);
-                } else if (channel == 'facet' || channel == 'column' || channel == 'row') {
-                    valuesToKeep = uniqueValues.slice(0, maxNominalValuesToKeep);
-                } else if (channel == 'x' || channel == 'y') {
-
-                    const oppositeChannel = channel === 'x' ? 'y' : 'x';
-                    const oppositeEncoding = vgObj.encoding?.[oppositeChannel];
-                    const colorEncoding = vgObj.encoding?.color;
-
-                    let isDescending = true;
-                    let sortChannel: string | undefined;
-                    let sortField: string | undefined;
-                    let sortFieldType: string | undefined;
-
-                    // Check if this axis already has a sort configuration
-                    if (encoding.sort) {
-                        if (typeof encoding.sort === 'string' && (encoding.sort === 'descending' || encoding.sort === 'ascending')) {
-                            isDescending = encoding.sort === 'descending';
-                            sortChannel = oppositeChannel;
-                            sortField = oppositeEncoding?.field;
-                            sortFieldType = oppositeEncoding?.type;
-                        } else if (typeof encoding.sort === 'string' && 
-                            (encoding.sort === '-y' || encoding.sort === '-x' || encoding.sort === '-color' || 
-                             encoding.sort === 'y' || encoding.sort === 'x' || encoding.sort === 'color')) {
-                                
-                            isDescending = encoding.sort.startsWith('-');
-                            sortChannel = isDescending ? encoding.sort.substring(1) : encoding.sort;
-                            if (sortChannel) {
-                                sortField = vgObj.encoding?.[sortChannel]?.field;
-                                sortFieldType = vgObj.encoding?.[sortChannel]?.type;
-                            }
-                        } 
-                    } else {
-                        // No explicit sort configuration, use the existing inference logic
-                        // Check if color field exists and is quantitative
-                        if (colorEncoding?.field && colorEncoding.type === 'quantitative') {
-                            // Sort by color field descending and take top maxNominalValues
-                            sortChannel = 'color';
-                            sortField = colorEncoding.field;
-                            sortFieldType = colorEncoding.type;
-                        } else if (oppositeEncoding?.type === 'quantitative') {
-                            // Sort by the quantitative field and take top maxNominalValues
-                            sortChannel = oppositeChannel;
-                            sortField = oppositeEncoding.field;
-                            sortFieldType = oppositeEncoding.type;
-                        } else {
-                            isDescending = false;
-                        }
-                    }
-
-                    if (!["Line Chart", "Custom Area Chart"].includes(chartType) &&
-                        sortField != undefined && sortChannel != undefined && sortFieldType === 'quantitative') {
-
-                        let aggregateOp = Math.max;
-                        let initialValue = -Infinity;
-
-                        if (chartType == "Bar" && sortChannel != 'color') {
-                            // bar chart by default will be stacked, so we need to sum the values
-                            aggregateOp = (x: number, y: number) => x + y;
-                            initialValue = 0;
-                        }
-
-                        // Efficient single-pass aggregation + partial sort
-                        const valueAggregates = new Map<string, number>();
-
-                        // Single pass through workingTable to compute aggregates
-                        for (const row of workingTable) {
-                            const fieldValue = row[fieldName];
-                            const sortValue = row[sortField as keyof typeof row] || 0;
-                            
-                            if (valueAggregates.has(fieldValue)) {
-                                valueAggregates.set(fieldValue, aggregateOp(valueAggregates.get(fieldValue)!, sortValue));
-                            } else {
-                                valueAggregates.set(fieldValue, aggregateOp(initialValue, sortValue));
-                            }
-                        }
-
-                        // Convert to array and get top-K efficiently
-                        const valueSortPairs = Array.from(valueAggregates.entries()).map(([value, sortValue]) => ({
-                            value,
-                            sortValue
-                        }));
-
-                        // Use efficient top-K selection
-                        if (valueSortPairs.length <= maxNominalValuesToKeep) {
-                            valuesToKeep = valueSortPairs
-                                .sort((a, b) => isDescending ? b.sortValue - a.sortValue : a.sortValue - b.sortValue)
-                                .map(v => v.value);
-                        } else {
-                            // For large datasets, use partial sort (more efficient than full sort)
-                            const compareFn = (a: {value: string, sortValue: number}, b: {value: string, sortValue: number}) => 
-                                isDescending ? b.sortValue - a.sortValue : a.sortValue - b.sortValue;
-                            
-                            // Sort only the top K elements
-                            valuesToKeep = valueSortPairs
-                                .sort(compareFn)
-                                .slice(0, maxNominalValuesToKeep)
-                                .map(v => v.value);
-                        }
-                    } else {
-                        // If sort field is not available or not quantitative, fall back to default
-                        if (typeof encoding.sort === 'string' && 
-                            encoding.sort === 'descending' || encoding.sort === `-${channel}`) {
-                            valuesToKeep = uniqueValues.reverse().slice(0, maxNominalValuesToKeep);
-                        } else {
-                            valuesToKeep = uniqueValues.slice(0, maxNominalValuesToKeep);
-                        }
-                    }
-                } else {
-                    valuesToKeep = uniqueValues.slice(0, maxNominalValuesToKeep);
-                }
-
-                // Filter the working table
-                const omittedCount = uniqueValues.length - valuesToKeep.length;
-                const placeholder = `...${omittedCount} items omitted`;
-                if (channel != 'color') {
-                    values = values.filter((row: any) => valuesToKeep.includes(row[fieldName]));
-                }
-
-                // Add text formatting configuration
-                if (!encoding.axis) {
-                    encoding.axis = {};
-                }
-                encoding.axis.labelColor = {
-                    condition: {
-                        test: `datum.label == '${placeholder}'`,
-                        value: "#999999"
-                    },
-                    value: "#000000" // default color for other labels
-                };
-
-                // Add placeholder to domain
-                if (channel == 'x' || channel == 'y') {
-                    if (!encoding.scale) {
-                        encoding.scale = {};
-                    }
-                    encoding.scale.domain = [...valuesToKeep, placeholder]
-                } else if (channel == 'color') {
-                    if (!encoding.legend) {
-                        encoding.legend = {};
-                    }
-                    encoding.legend.values = [...valuesToKeep, placeholder]
-                }
-            }
-        }
-    }
-
-    if (vgObj.encoding?.column != undefined && vgObj.encoding?.row == undefined) {
-
-        vgObj['encoding']['facet'] = vgObj['encoding']['column'];
-
-        let expectedXNominalCount = nominalCount.x;
-        if (nominalCount.xOffset > 0) {
-            expectedXNominalCount = nominalCount.x * nominalCount.xOffset;
-        }
-
-        vgObj['encoding']['facet']['columns'] = 6;
-        if (expectedXNominalCount > 40) {
-            vgObj['encoding']['facet']['columns'] = 1;
-        } else if (expectedXNominalCount > 20) {
-            vgObj['encoding']['facet']['columns'] = 3;
-        }
-
-        if (Math.floor(nominalCount.column / vgObj['encoding']['facet']['columns']) >= 3) {
-            vgObj['resolve'] = {
-                "axis": {
-                    "x": "independent",
-                }
-            }
-        }
-        
-        delete vgObj['encoding']['column'];
-    }
-
-    // total facets is the product of the number of columns and rows
-    let totalFacets = nominalCount.column > 0 ? nominalCount.column : 1;
-    totalFacets *= nominalCount.row > 0 ? nominalCount.row : 1;
-    totalFacets *= nominalCount.xOffset > 0 ? Math.min(nominalCount.xOffset, nominalCount.x) : 1;
-
-    let facetRescaleFactor = 1;
-    if (totalFacets > 6) {
-        facetRescaleFactor = 0.4;
-    } else if (totalFacets > 4) {
-        facetRescaleFactor = 0.5;
-    } else if (totalFacets > 1) {
-        facetRescaleFactor = 0.75;
-    }
-
-    for (const channel of ['facet', 'column', 'row']) {
-        const encoding = vgObj.encoding?.[channel];
-        if (encoding?.type === 'quantitative') {
-            const fieldName = encoding.field;
-            const uniqueValues = [...new Set(values.map((r: any) => r[fieldName]))];
-            if (uniqueValues.length > maxFacetNominalValues) {
-                encoding.bin = true;
-            }
-        }
-    }
-    
-    let xTotalNominalCount = nominalCount.x;
-    if (nominalCount.xOffset > 0) {
-        xTotalNominalCount = nominalCount.x * nominalCount.xOffset;
-    }
-    let yTotalNominalCount = nominalCount.y;
-
-    // Check if y-axis should have independent scaling when columns have vastly different value ranges
-    if (vgObj.encoding?.facet != undefined && vgObj.encoding?.y?.type === 'quantitative') {
-        const yField = vgObj.encoding.y.field;
-        const columnField = vgObj.encoding.facet.field;
-        
-        if (yField && columnField) {
-            // Group data by column values and find max y value for each column
-            const columnGroups = new Map<any, number>();
-            
-            for (const row of workingTable) {
-                const columnValue = row[columnField];
-                const yValue = row[yField];
-                
-                if (yValue != null && !isNaN(yValue)) {
-                    const currentMax = columnGroups.get(columnValue) || 0;
-                    columnGroups.set(columnValue, Math.max(currentMax, Math.abs(yValue)));
-                }
-            }
-            
-            // Find the ratio between max and min column max values
-            const maxValues = Array.from(columnGroups.values()).filter(v => v > 0);
-            if (maxValues.length >= 2) {
-                const maxValue = Math.max(...maxValues);
-                const minValue = Math.min(...maxValues);
-                const ratio = maxValue / minValue;
-                
-                // If difference is 100x or more, use independent y-axis scaling
-                if (ratio >= 100 && totalFacets < 6) {
-                    if (!vgObj.resolve) {
-                        vgObj.resolve = {};
-                    }
-                    if (!vgObj.resolve.scale) {
-                        vgObj.resolve.scale = {};
-                    }
-                    vgObj.resolve.scale.y = "independent";
-                }
-            }
-        }
-    }
-
-    // Apply 0.75 scale factor for faceted charts
-    const widthScale = facetRescaleFactor;
-    const heightScale = facetRescaleFactor;
-
-    let stepSize = Math.max(8, Math.min(defaultStepSize, 
-        Math.floor(facetRescaleFactor * defaultChartHeight * 2 / Math.max(xTotalNominalCount, yTotalNominalCount))));
-
-    vgObj['config'] = {
-        "view": {
-            "continuousWidth": defaultChartWidth * widthScale,
-            "continuousHeight": defaultChartHeight * heightScale,
-            "step": stepSize,
-
+    const spec = assembleVegaLite({
+        data: { values: workingTable },
+        semantic_types: semanticTypes,
+        chart_spec: {
+            chartType,
+            encodings,
+            ...(title ? { title } : {}),
+            ...(subtitle ? { subtitle } : {}),
+            // DF's default chart width/height is the *target* size → flint `baseSize`.
+            // The hard ceiling is base × stretch (see `stretch` above), so charts render
+            // at the configured size and only grow under pressure up to that ceiling.
+            baseSize: { width: effectiveW, height: effectiveH },
+            canvasSize: {
+                width: Math.round(effectiveW * stretch),
+                height: Math.round(effectiveH * stretch),
+            },
+            chartProperties: chartProperties ? structuredClone(chartProperties) : undefined,
         },
-        "axisX": {"labelLimit": 100, "labelFontSize": stepSize <= 10 ? stepSize : 10},
-        "axisY": {"labelFontSize": stepSize <= 10 ? stepSize : 10},
-    }
-    if (totalFacets > 6) {
-        vgObj['config']['header'] = { labelLimit: 120, labelFontSize: 9 };
-    }
-
-    if (addTooltips) {
-        // Add tooltip configuration to the mark
-        if (!vgObj.mark) {
-            vgObj.mark = {};
-        }
-        if (typeof vgObj.mark === 'string') {
-            vgObj.mark = { type: vgObj.mark };
-        }
-        
-        // Add tooltip to the mark
-        vgObj.mark.tooltip = true;
-    }
-
-    return {...vgObj, data: {values: values}}
-}
-
-export const adaptChart = (chart: Chart, targetTemplate: ChartTemplate) => {
-
-    let discardedChannels = Object.entries(chart.encodingMap).filter(([ch, enc]) => {
-        return !targetTemplate.channels.includes(ch) && enc.fieldID != undefined
+        options: {
+            addTooltips,
+            ...(maxStretchFactor != null ? { maxStretch: maxStretchFactor } : {}),
+            ...assembleOptions,
+        },
+        ...(themeId ? { theme_spec: themeId } : {}),
+        ...(Object.keys(fieldDisplayNames).length > 0 ? { field_display_names: fieldDisplayNames } : {}),
     });
 
-    let newEncodingMap = Object.assign({}, ...targetTemplate.channels.map((channel) => {
-        let encoding = Object.keys(chart.encodingMap).includes(channel) ? chart.encodingMap[channel as Channel] : { channel: channel, bin: false }
-        return { [channel]: encoding }
-    })) as EncodingMap
-
-    // for channels that will be discarded, find another way to adapt it
-    for (let [ch, enc] of discardedChannels) {
-        let otherChannelsFromSameGroup = (Object.entries(ChannelGroups).find(([grp, channelList]) => channelList.includes(ch)) as [string, string[]])[1]
-        let candChannels = targetTemplate.channels.filter(c => otherChannelsFromSameGroup.includes(c) && newEncodingMap[c as Channel].fieldID == undefined);
-        if (candChannels.length > 0) {
-            newEncodingMap[candChannels[0] as Channel] = enc
-        }
+    // Published flint-chart 0.4.1 ignores chart-level title/subtitle fields;
+    // live Flint consumes them above and owns fitting. Keep this fallback until
+    // the package release catches up with the live authoring contract.
+    if (title && !spec.title) {
+        spec.title = {
+            text: title,
+            ...(subtitle ? { subtitle } : {}),
+            anchor: 'middle',
+            fontWeight: 500,
+            fontSize: 13,
+            subtitleFontSize: 11,
+            color: '#555',
+            offset: 12,
+        };
     }
 
-    return { ...chart, chartType: targetTemplate.chart, encodingMap: newEncodingMap }
+    return spec;
 }
 
-export const resolveRecommendedChart = (refinedGoal: any, allFields: FieldItem[], table: DictTable) => {
-    
-    let rawChartType = refinedGoal['chart_type'];
-    let chartEncodings = refinedGoal['chart_encodings'];
+// resolveRecommendedChart & resolveChartFields remain in app layer (need generateFreshChart, Chart)
+export { resolveRecommendedChart, resolveChartFields } from './chartRecommendation';
 
-    if (chartEncodings == undefined || rawChartType == undefined) {
-        let newChart = generateFreshChart(table.id, 'Scatter Plot') as Chart;
-        let basicEncodings : { [key: string]: string } = table.names.length > 1 ? {x: table.names[0], y: table.names[1]} : {};
-        newChart = resolveChartFields(newChart, allFields, basicEncodings, table);
-        return newChart;
-    }
-
-    let chartTypeMap : any = {
-        "line" : "Line Chart",
-        "histogram": "Bar Chart",
-        "bar": "Bar Chart",
-        "point": "Scatter Plot",
-        "boxplot": "Boxplot",
-        "area": "Custom Area",
-        "heatmap": "Heatmap",
-        "group_bar": "Grouped Bar Chart"
-    }
-    let chartType = chartTypeMap[rawChartType] || 'Scatter Plot';
-    let newChart = generateFreshChart(table.id, chartType) as Chart;
-    newChart = resolveChartFields(newChart, allFields, chartEncodings, table);
-    if (rawChartType == "histogram") {
-        newChart.encodingMap.y = { aggregate: "count" };
-    }
-    return newChart;
-}
-
-export const resolveChartFields = (chart: Chart, allFields: FieldItem[], chartEncodings: { [key: string]: string }, table: DictTable) => {
-    // Get the keys that should be present after this update
-    const newEncodingKeys = new Set(Object.keys(chartEncodings).map(key => key === "facet" ? "column" : key));
-    
-    // Remove encodings that are no longer in chartEncodings
-    for (const key of Object.keys(chart.encodingMap)) {
-        if (!newEncodingKeys.has(key) && chart.encodingMap[key as Channel]?.fieldID != undefined) {
-            chart.encodingMap[key as Channel] = {};
-        }
-    }
-    
-    // Add/update encodings from chartEncodings
-    for (let [key, value] of Object.entries(chartEncodings)) {
-        if (key == "facet") {
-            key = "column";
-        }
-
-        let field = allFields.find(c => c.name === value);
-        if (field) {
-            chart.encodingMap[key as Channel] = { fieldID: field.id };
-        }
-    }
-    
-    return chart;
-}
-
-export let getTriggers = (leafTable: DictTable, tables: DictTable[]) => {
-    // recursively find triggers that ends in leafTable (if the leaf table is anchored, we will find till the previous table is anchored)
+export let getTriggers = (leafTable: DictTable, tables: DictTable[]): Trigger[] => {
+    // Recursively find the complete trigger chain from the source to leafTable.
     let triggers : Trigger[] = [];
     let t = leafTable;
     
     while(true) {
         // this is when we find an original table
         if (t.derive == undefined) {
-            break;
-        }
-
-        // this is when we find an anchored table (which is not the leaf table)
-        if (t !== leafTable && t.anchored) {
             break;
         }
 

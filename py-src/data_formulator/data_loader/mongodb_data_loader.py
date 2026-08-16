@@ -1,103 +1,107 @@
-import json
-import string
-import random as rand
-
-import pandas as pd
-import duckdb
-import pymongo
-from bson import ObjectId
+import logging
 from datetime import datetime
 
-from data_formulator.data_loader.external_data_loader import ExternalDataLoader, sanitize_table_name
+import re
+import pandas as pd
+import pyarrow as pa
+import pymongo
+from bson import ObjectId
 
-from data_formulator.security import validate_sql_query
-from typing import Dict, Any, Optional, List
+from data_formulator.data_loader.external_data_loader import ExternalDataLoader, CatalogNode, MAX_IMPORT_ROWS, sanitize_table_name
+from data_formulator.data_loader import probe_utils
+from data_formulator.datalake.parquet_utils import df_to_safe_records
+from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class MongoDBDataLoader(ExternalDataLoader):
+    DISPLAY_NAME = "MongoDB"
+    DESCRIPTION = "Connect to a MongoDB database and load documents from collections."
 
     @staticmethod
-    def list_params() -> bool:
+    def list_params() -> list[dict[str, Any]]:
         params_list = [
-            {"name": "host", "type": "string", "required": True, "default": "localhost", "description": ""}, 
-            {"name": "port", "type": "int", "required": False, "default": 27017, "description": "MongoDB server port (default 27017)"},
-            {"name": "username", "type": "string", "required": False, "default": "", "description": ""},
-            {"name": "password", "type": "string", "required": False, "default": "", "description": ""},
-            {"name": "database", "type": "string", "required": True, "default": "", "description": ""},
-            {"name": "collection", "type": "string", "required": False, "default": "", "description": "If specified, only this collection will be accessed"},
-            {"name": "authSource", "type": "string", "required": False, "default": "", "description": "Authentication database (defaults to target database if empty)"}
+            {"name": "host", "type": "string", "required": True, "default": "localhost", "tier": "connection", "description": "server address"}, 
+            {"name": "port", "type": "int", "required": False, "default": 27017, "tier": "connection", "advanced": True, "description": "server port"},
+            {"name": "username", "type": "string", "required": False, "default": "", "tier": "auth", "description": "leave blank if no auth"},
+            {"name": "password", "type": "string", "required": False, "default": "", "sensitive": True, "tier": "auth", "description": "leave blank if no auth"},
+            {"name": "database", "type": "string", "required": True, "default": "", "tier": "connection", "description": "database name"},
+            {"name": "collection", "type": "string", "required": False, "default": "", "tier": "filter", "description": "leave empty to list all collections"},
+            {"name": "authSource", "type": "string", "required": False, "default": "", "tier": "auth", "description": "auth database (defaults to target database)"}
         ]
         return params_list
 
-    @staticmethod
-    def auth_instructions() -> str:
-        return """
-MongoDB Connection Instructions:
+    @classmethod
+    def auth_paths(cls) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "none",
+                "label": "No authentication",
+                "description": "Connect to a server that does not require credentials.",
+                "fields": [],
+                "required_fields": [],
+                "kind": "ambient",
+                "default": True,
+            },
+            {
+                "id": "credentials",
+                "label": "Username and password",
+                "description": "Sign in with a MongoDB user. Set the auth database only when it differs from the target database.",
+                "fields": ["username", "password", "authSource"],
+                "required_fields": ["username", "password"],
+                "kind": "credentials",
+            },
+        ]
 
-1. Local MongoDB Setup:
-   - Ensure MongoDB server is running on your machine
-   - Default connection: host='localhost', port=27017
-   - If authentication is not enabled, leave username and password empty
+    @classmethod
+    def infer_auth_path(cls, params: dict[str, Any]) -> str:
+        if params.get("username") or params.get("password"):
+            return "credentials"
+        return "none"
 
-2. Remote MongoDB Connection:
-   - Obtain host address, port, username, and password from your database administrator
-   - Ensure the MongoDB server allows remote connections
+    AUTH_GUIDE = "mongodb.md"
 
-3. Common Connection Parameters:
-   - host: MongoDB server address (default: 'localhost')
-   - port: MongoDB server port (default: 27017)
-   - username: Your MongoDB username (leave empty if no auth)
-   - password: Your MongoDB password (leave empty if no auth)
-   - database: Target database name to connect to
-   - collection: (Optional) Specific collection to access, leave empty to list all collections
-
-4. Troubleshooting:
-   - Verify MongoDB service is running: `mongod --version`
-   - Test connection: `mongosh --host [host] --port [port]`
-"""
-
-    def __init__(self, params: Dict[str, Any], duck_db_conn: duckdb.DuckDBPyConnection):
+    def __init__(self, params: dict[str, Any]):
         self.params = params
-        self.duck_db_conn = duck_db_conn
-        
+
+        self.host = self.params.get("host", "localhost")
+        self.port = int(self.params.get("port", 27017))
+        self.username = self.params.get("username", "")
+        self.password = self.params.get("password", "")
+        self.database_name = self.params.get("database", "")
+        self.collection_name = self.params.get("collection", "")
+        auth_source = self.params.get("authSource", "") or self.database_name
+
         try:
-            # Create MongoDB client
-            host = self.params.get("host", "localhost")
-            port = int(self.params.get("port", 27017))
-            username = self.params.get("username", "")
-            password = self.params.get("password", "")
-            database = self.params.get("database", "")
-            collection = self.params.get("collection", "")
-            auth_source = self.params.get("authSource", "") or database  # Default to target database
-            
-            if username and password:
-                # Use authSource to specify which database contains user credentials
+            if self.username and self.password:
                 self.mongo_client = pymongo.MongoClient(
-                    host=host, 
-                    port=port, 
-                    username=username, 
-                    password=password,
+                    host=self.host,
+                    port=self.port,
+                    username=self.username,
+                    password=self.password,
                     authSource=auth_source
                 )
             else:
-                self.mongo_client = pymongo.MongoClient(host=host, port=port)
-            
-            self.db = self.mongo_client[database]
-            self.database_name = database
-            
-            self.collection = self.db[collection] if collection else None
-            
+                self.mongo_client = pymongo.MongoClient(host=self.host, port=self.port)
+
+            self.db = self.mongo_client[self.database_name]
+            self.collection = self.db[self.collection_name] if self.collection_name else None
+
+            logger.info(f"Successfully connected to MongoDB: {self.host}:{self.port}/{self.database_name}")
+
         except Exception as e:
-            raise Exception(f"Failed to connect to MongoDB: {e}")
+            logger.error(f"Failed to connect to MongoDB: {e}")
+            raise RuntimeError(f"Failed to connect to MongoDB: {e}") from e
     
     def close(self):
-        """Close the MongoDB connection"""
+        """Close the MongoDB connection."""
         if hasattr(self, 'mongo_client') and self.mongo_client is not None:
             try:
                 self.mongo_client.close()
                 self.mongo_client = None
             except Exception as e:
-                print(f"Warning: Failed to close MongoDB connection: {e}")
+                logger.warning(f"Failed to close MongoDB connection: {e}")
 
     def __enter__(self):
         """Context manager entry"""
@@ -113,7 +117,7 @@ MongoDB Connection Instructions:
         self.close()
     
     @staticmethod
-    def _flatten_document(doc: Dict[str, Any], parent_key: str = '', sep: str = '_') -> Dict[str, Any]:
+    def _flatten_document(doc: dict[str, Any], parent_key: str = '', sep: str = '_') -> dict[str, Any]:
         """
         Use recursion to flatten nested MongoDB documents
         """
@@ -139,7 +143,7 @@ MongoDB Connection Instructions:
         return dict(items)
     
     @staticmethod
-    def _convert_special_types(doc: Dict[str, Any]) -> Dict[str, Any]:
+    def _convert_special_types(doc: dict[str, Any]) -> dict[str, Any]:
         """
         Convert MongoDB special types (ObjectId, datetime, etc.) to serializable types
         """
@@ -165,7 +169,7 @@ MongoDB Connection Instructions:
                 result[key] = value
         return result
     
-    def _process_documents(self, documents: List[Dict[str, Any]]) -> pd.DataFrame:
+    def _process_documents(self, documents: list[dict[str, Any]]) -> pd.DataFrame:
         """
         Process MongoDB documents list, flatten and convert to DataFrame
         """
@@ -180,8 +184,220 @@ MongoDB Connection Instructions:
         
         df = pd.DataFrame(processed_docs)
         return df
+
+    def fetch_data_as_arrow(
+        self,
+        source_table: str,
+        import_options: dict[str, Any] | None = None,
+    ) -> pa.Table:
+        opts = import_options or {}
+        size = min(opts.get("size", MAX_IMPORT_ROWS), MAX_IMPORT_ROWS)
+        sort_columns = opts.get("sort_columns")
+        sort_order = opts.get("sort_order", "asc")
+        """
+        Fetch data from MongoDB as a PyArrow Table.
         
-    def list_tables(self, table_filter: str = None):
+        MongoDB doesn't have native Arrow support, so we fetch documents,
+        process them, and convert to Arrow format.
+        
+        Args:
+            source_table: Collection name to fetch from
+            size: Maximum number of documents to fetch
+            sort_columns: Columns to sort by
+            sort_order: Sort direction ('asc' or 'desc')
+        """
+        if not source_table:
+            raise ValueError("source_table (collection name) must be provided")
+        
+        # Get collection
+        collection_name = source_table
+        # Handle full table names like "database.collection"
+        if '.' in collection_name:
+            parts = collection_name.split('.')
+            collection_name = parts[-1]
+        
+        collection = self.db[collection_name]
+        
+        logger.info(f"Fetching from MongoDB collection: {collection_name}")
+        
+        # Build cursor with optional sorting
+        data_cursor = collection.find()
+        if sort_columns and len(sort_columns) > 0:
+            sort_direction = -1 if sort_order == 'desc' else 1
+            sort_spec = [(col, sort_direction) for col in sort_columns]
+            data_cursor = data_cursor.sort(sort_spec)
+        data_cursor = data_cursor.limit(size)
+        
+        # Fetch and process documents
+        data_list = list(data_cursor)
+        if not data_list:
+            logger.warning(f"No data found in MongoDB collection '{collection_name}'")
+            return pa.table({})
+        
+        df = self._process_documents(data_list)
+        
+        # Convert to Arrow
+        arrow_table = pa.Table.from_pandas(df, preserve_index=False)
+        
+        logger.info(f"Fetched {arrow_table.num_rows} rows from MongoDB collection '{collection_name}'")
+        
+        return arrow_table
+
+    def probe(self, path: list[str], query: dict[str, Any]) -> dict[str, Any]:
+        """Compile the SPJQ to a MongoDB aggregation pipeline and run it.
+
+        Native pushdown: ``$match / $group / $sort / $limit`` runs server-side
+        over the whole collection, so the result is exact.
+        """
+        if not path:
+            return {"error": "probe requires a non-empty table path"}
+        q = query or {}
+        out_limit = probe_utils.clamp_probe_limit(q.get("limit"))
+        collection_name = str(path[-1])
+        try:
+            pipeline = self._compile_probe_pipeline(q, out_limit)
+        except ValueError as exc:
+            return {"error": f"invalid probe query: {exc}"}
+        try:
+            docs = list(self.db[collection_name].aggregate(pipeline))
+        except Exception as exc:
+            logger.debug("probe pipeline failed: %s", pipeline, exc_info=True)
+            return {"error": f"probe failed: {exc}"}
+        if not docs:
+            return {
+                "rows": [], "columns": [], "row_count": 0,
+                "exact": True, "compiled_note": None,
+            }
+        arrow = pa.Table.from_pandas(
+            self._process_documents(docs), preserve_index=False,
+        )
+        return probe_utils.shape_probe_payload(arrow, out_limit, exact=True)
+
+    # -- Aggregation-pipeline probe compiler -------------------------------
+
+    def _compile_probe_pipeline(
+        self, query: dict[str, Any], out_limit: int,
+    ) -> list[dict[str, Any]]:
+        """Compile a probe SPJQ object into a MongoDB aggregation pipeline."""
+        columns = query.get("columns") or []
+        group_by = query.get("group_by") or []
+        aggregates = query.get("aggregates") or []
+        order_by = query.get("order_by") or []
+        filters = query.get("filters") or []
+
+        pipeline: list[dict[str, Any]] = []
+
+        match = self._compile_match(filters)
+        if match:
+            pipeline.append({"$match": match})
+
+        if aggregates or group_by:
+            group_id = {g: f"${g}" for g in group_by} if group_by else None
+            group_stage: dict[str, Any] = {"_id": group_id}
+            distinct_aliases: set[str] = set()
+            aliases: list[str] = []
+            for agg in aggregates:
+                if not isinstance(agg, dict):
+                    continue
+                op = (agg.get("op") or "").lower().strip()
+                col = agg.get("column")
+                alias = str(agg.get("as") or (f"{op}_{col}" if col else op))
+                aliases.append(alias)
+                if op == "count" and not col:
+                    group_stage[alias] = {"$sum": 1}
+                elif op == "count":
+                    group_stage[alias] = {
+                        "$sum": {"$cond": [{"$eq": [f"${col}", None]}, 0, 1]}
+                    }
+                elif op == "count_distinct":
+                    if not col:
+                        raise ValueError("count_distinct requires a column")
+                    group_stage[alias] = {"$addToSet": f"${col}"}
+                    distinct_aliases.add(alias)
+                elif op in ("sum", "avg", "min", "max"):
+                    if not col:
+                        raise ValueError(f"aggregate {op} requires a column")
+                    group_stage[alias] = {f"${op}": f"${col}"}
+                else:
+                    raise ValueError(f"unsupported aggregate op: {op!r}")
+            pipeline.append({"$group": group_stage})
+
+            # Lift the group keys back to top-level fields and size the
+            # distinct sets so the shape matches the SQL semantics.
+            project: dict[str, Any] = {"_id": 0}
+            for g in group_by:
+                project[g] = f"$_id.{g}"
+            for alias in aliases:
+                project[alias] = {"$size": f"${alias}"} if alias in distinct_aliases else 1
+            pipeline.append({"$project": project})
+        elif columns:
+            project = {"_id": 0}
+            for c in columns:
+                project[str(c)] = 1
+            pipeline.append({"$project": project})
+
+        sort_spec: list[tuple[str, int]] = []
+        for o in order_by:
+            if not isinstance(o, dict):
+                continue
+            col = o.get("column")
+            if not col:
+                continue
+            direction = -1 if str(o.get("dir", "")).lower() == "desc" else 1
+            sort_spec.append((str(col), direction))
+        if sort_spec:
+            pipeline.append({"$sort": dict(sort_spec)})
+
+        pipeline.append({"$limit": int(out_limit)})
+        return pipeline
+
+    @staticmethod
+    def _compile_match(filters: list[dict[str, Any]]) -> dict[str, Any]:
+        """Compile probe ``filters`` into a MongoDB ``$match`` document."""
+        conds: list[dict[str, Any]] = []
+        for f in filters or []:
+            if not isinstance(f, dict):
+                continue
+            col = f.get("column")
+            op = (f.get("op") or "").upper().strip()
+            if not col:
+                continue
+            col = str(col)
+            val = f.get("value")
+            if op == "EQ":
+                conds.append({col: {"$eq": val}})
+            elif op == "NEQ":
+                conds.append({col: {"$ne": val}})
+            elif op == "GT":
+                conds.append({col: {"$gt": val}})
+            elif op == "GTE":
+                conds.append({col: {"$gte": val}})
+            elif op == "LT":
+                conds.append({col: {"$lt": val}})
+            elif op == "LTE":
+                conds.append({col: {"$lte": val}})
+            elif op in ("LIKE", "ILIKE"):
+                conds.append({col: {"$regex": re.escape(str(val)), "$options": "i"}})
+            elif op == "IN":
+                vals = val if isinstance(val, (list, tuple)) else [val]
+                conds.append({col: {"$in": list(vals)}})
+            elif op == "NOT_IN":
+                vals = val if isinstance(val, (list, tuple)) else [val]
+                conds.append({col: {"$nin": list(vals)}})
+            elif op == "IS_NULL":
+                conds.append({col: {"$eq": None}})
+            elif op == "IS_NOT_NULL":
+                conds.append({col: {"$ne": None}})
+            elif op == "BETWEEN":
+                if isinstance(val, (list, tuple)) and len(val) == 2:
+                    conds.append({col: {"$gte": val[0], "$lte": val[1]}})
+        if not conds:
+            return {}
+        if len(conds) == 1:
+            return conds[0]
+        return {"$and": conds}
+
+    def list_tables(self, table_filter: str | None = None) -> list[dict[str, Any]]:
         """
         List all collections
         """
@@ -220,7 +436,7 @@ MongoDB Connection Instructions:
                     } for col in df.columns]
                     
                     # Convert sample_data for return
-                    sample_rows = json.loads(df.to_json(orient="records"))
+                    sample_rows = df_to_safe_records(df)
                 else:
                     columns = []
                     sample_rows = []
@@ -233,195 +449,71 @@ MongoDB Connection Instructions:
                 
                 results.append({
                     "name": full_table_name,
+                    "path": [collection_name],
                     "metadata": table_metadata
                 })
             except Exception as e:
+                logger.debug(f"Error listing collection {collection_name}: {e}")
                 continue
-        
+
         return results
-    
-    def ingest_data(self, table_name: str, name_as: Optional[str] = None, size: int = 100000, sort_columns: List[str] = None, sort_order: str = 'asc'):
-        """
-        Import MongoDB collection data into DuckDB
-        """
-        # Extract collection name from full table name
-        parts = table_name.split('.')
-        if len(parts) >= 3:
-            collection_name = parts[-1]
-        else:
-            collection_name = table_name
-        
-        if name_as is None:
-            name_as = collection_name
 
-        # Get and process data from MongoDB (limit rows)
-        collection = self.db[collection_name]
-        
-        # Build cursor with optional sorting
-        data_cursor = collection.find()
-        if sort_columns and len(sort_columns) > 0:
-            # MongoDB sort format: 1 for ascending, -1 for descending
-            sort_direction = -1 if sort_order == 'desc' else 1
-            sort_spec = [(col, sort_direction) for col in sort_columns]
-            data_cursor = data_cursor.sort(sort_spec)
-        data_cursor = data_cursor.limit(size)
-        
-        data_list = list(data_cursor)
-        if not data_list:
-            raise Exception(f"No data found in MongoDB collection '{collection_name}'.")
-        df = self._process_documents(data_list)
+    # -- Catalog tree API --------------------------------------------------
 
-        name_as = sanitize_table_name(name_as)
-
-        self._load_dataframe_to_duckdb(df, name_as, size)
-        return
-
-    
-    def view_query_sample(self, query: str) -> List[Dict[str, Any]]:
-
-        self._existed_collections_in_duckdb()
-        self._difference_collections()
-        self._preload_all_collections(self.collection.name if self.collection else "")
-
-        result, error_message = validate_sql_query(query)
-        if not result:
-            print(error_message)
-            raise ValueError(error_message)
-        
-        result_query = json.loads(self.duck_db_conn.execute(query).df().head(10).to_json(orient="records"))
-
-        self._drop_all_loaded_tables()
-
-        for collection_name, df in self.existed_collections.items():
-            self._load_dataframe_to_duckdb(df, collection_name)
-
-        return result_query
-    
-    def ingest_data_from_query(self, query: str, name_as: str) -> pd.DataFrame:
-        """
-        Create a new table from query results
-        """
-        result, error_message = validate_sql_query(query)
-        if not result:
-            raise ValueError(error_message)
-        
-        name_as = sanitize_table_name(name_as)
-
-        self._existed_collections_in_duckdb()
-        self._difference_collections()
-        self._preload_all_collections(self.collection.name if self.collection else "")
-        
-        query_result_df = self.duck_db_conn.execute(query).df()
-
-        self._drop_all_loaded_tables()
-
-        for collection_name, existing_df in self.existed_collections.items():
-            self._load_dataframe_to_duckdb(existing_df, collection_name)
-        
-        self._load_dataframe_to_duckdb(query_result_df, name_as)
-
-        return query_result_df
-    
     @staticmethod
-    def _quote_identifier(name: str) -> str:
-        """
-        Safely quote a SQL identifier to prevent SQL injection.
-        Double quotes are escaped by doubling them.
-        """
-        # Escape any double quotes in the identifier by doubling them
-        escaped = name.replace('"', '""')
-        return f'"{escaped}"'
+    def catalog_hierarchy() -> list[dict[str, str]]:
+        return [
+            {"key": "database", "label": "Database"},
+            {"key": "collection", "label": "Collection"},
+        ]
 
-    def _existed_collections_in_duckdb(self):
-        """
-        Return the names and contents of tables already loaded into DuckDB
-        """
-        self.existed_collections = {}
-        duckdb_tables = self.duck_db_conn.execute("SHOW TABLES").df()
-        for _, row in duckdb_tables.iterrows():
-            collection_name = row['name']
-            quoted_name = self._quote_identifier(collection_name)
-            df = self.duck_db_conn.execute(f"SELECT * FROM {quoted_name}").df()
-            self.existed_collections[collection_name] = df
+    def ls(self, path: list[str] | None = None, filter: str | None = None) -> list[CatalogNode]:
+        path = path or []
+        eff = self.effective_hierarchy()
+        if len(path) >= len(eff):
+            return []
+        level_key = eff[len(path)]["key"]
 
+        if level_key == "database":
+            # database is required, so always pinned — but handle defensively
+            return [CatalogNode(
+                name=self.database_name, node_type="namespace",
+                path=path + [self.database_name],
+            )]
 
-    def _difference_collections(self):
-        """
-        Return the difference between all collections and loaded collections
-        """
-        self.diff_collections = []
-        all_collections = set(self.db.list_collection_names())
-        loaded_collections = set(self.existed_collections)
-        diff_collections = all_collections - loaded_collections
-        self.diff_collections = list(diff_collections)
-        print(f'Difference collections: {self.diff_collections}')
-
-    def _drop_all_loaded_tables(self):
-        """
-        Drop all tables loaded into DuckDB
-        """
-        for table_name in self.loaded_tables.values():
-            try:
-                quoted_name = self._quote_identifier(table_name)
-                self.duck_db_conn.execute(f"DROP TABLE IF EXISTS main.{quoted_name}")
-                print(f"Dropped loaded table: {table_name}")
-            except Exception as e:
-                print(f"Warning: Failed to drop table '{table_name}': {e}")
-
-    def _preload_all_collections(self, specified_collection: str = "", size: int = 100000):
-        """
-        Preload all MongoDB collections into DuckDB memory
-        """
-        # Get the list of collections to load
-        if specified_collection:
-            collection_names = [specified_collection]
-        else:
+        if level_key == "collection":
             collection_names = self.db.list_collection_names()
-        
-        # Record loaded tables
-        self.loaded_tables = {}
-        
-        for collection_name in collection_names:
-            try:
-                collection = self.db[collection_name]
-                
-                # Get data
-                data_cursor = collection.find().limit(size)
-                data_list = list(data_cursor)
-                
-                if not data_list:
-                    print(f"Skipping empty collection: {collection_name}")
+            nodes = []
+            for name in sorted(collection_names):
+                if filter and filter.lower() not in name.lower():
                     continue
-                
-                df = self._process_documents(data_list)
-                
-                # Generate table name
-                table_name = sanitize_table_name(collection_name)
-                
-                # Load into DuckDB
-                self._load_dataframe_to_duckdb(df, table_name)
-                
-                # Record mapping
-                self.loaded_tables[collection_name] = table_name
-                print(f"Preloaded collection '{collection_name}' as table '{table_name}' ({len(data_list)} rows)")
-                
-            except Exception as e:
-                print(f"Warning: Failed to preload collection '{collection_name}': {e}")
+                nodes.append(CatalogNode(name=name, node_type="table", path=path + [name]))
+            return nodes
 
-    def _load_dataframe_to_duckdb(self, df: pd.DataFrame, table_name: str, size: int = 1000000):
-        """
-        Load DataFrame into DuckDB
-        """
-        # Create table using a temporary view
-        random_suffix = ''.join(rand.choices(string.ascii_letters + string.digits, k=6))
-        temp_view_name = f'df_temp_{random_suffix}'
+        return []
 
-        self.duck_db_conn.register(temp_view_name, df)
-        # Use CREATE OR REPLACE to directly replace existing table
-        # Quote identifiers to prevent SQL injection
-        quoted_table_name = self._quote_identifier(table_name)
-        quoted_temp_view = self._quote_identifier(temp_view_name)
-        # Ensure size is an integer to prevent injection via size parameter
-        safe_size = int(size)
-        self.duck_db_conn.execute(f"CREATE OR REPLACE TABLE main.{quoted_table_name} AS SELECT * FROM {quoted_temp_view} LIMIT {safe_size}")
-        self.duck_db_conn.execute(f"DROP VIEW {quoted_temp_view}")
+    def get_metadata(self, path: list[str]) -> dict[str, Any]:
+        if not path:
+            return {}
+        collection_name = path[-1]
+        try:
+            coll = self.db[collection_name]
+            row_count = coll.count_documents({})
+            sample = list(coll.find().limit(5))
+            if sample:
+                df = self._process_documents(sample)
+                columns = [{"name": c, "type": str(df[c].dtype)} for c in df.columns]
+                sample_rows = df_to_safe_records(df)
+            else:
+                columns, sample_rows = [], []
+            return {"row_count": row_count, "columns": columns, "sample_rows": sample_rows}
+        except Exception as e:
+            logger.warning(f"get_metadata failed for {path}: {e}")
+            return {}
+
+    def test_connection(self) -> bool:
+        try:
+            self.mongo_client.admin.command("ping")
+            return True
+        except Exception:
+            return False
